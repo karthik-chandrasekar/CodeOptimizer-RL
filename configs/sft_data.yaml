@@ -1,0 +1,20 @@
+# Stage 2a: agent-SFT trajectories  (python -m tinyperf.train.sft_data --config configs/sft_data.yaml)
+sft_data:
+  tasks: artifacts/data/train.jsonl
+  out_path: artifacts/sft/trajectories.jsonl
+  methods: [programmatic, search]   # add `teacher` for Method B (needs ANTHROPIC_API_KEY + pip install anthropic)
+  n_tasks: 4000
+  programmatic_per_task: 2          # reverse-chain replay + direct jump
+  search_beam: 3
+  search_candidates: 6
+  failure_injection_prob: 0.35      # insert a verified-bad edit followed by recovery
+  teacher_model: claude-sonnet-4-6
+  teacher_candidates: 6
+  teacher_max_depth: 3
+env:
+  horizon: 6
+  improvement_delta: 0.03
+  feedback: full                    # trajectories always carry full feedback; the no-feedback ablation masks it at train time
+  max_parallel_envs: 8
+  timing:
+    repeats: 5

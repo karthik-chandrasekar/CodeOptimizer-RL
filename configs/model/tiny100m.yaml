@@ -1,0 +1,11 @@
+name: tinyperf-100m
+vocab_size: 8192
+n_layer: 12
+n_embd: 768
+n_head: 12
+mlp_dim: 3072
+max_seq_len: 2048
+dropout: 0.0
+tie_embeddings: true
+rope_theta: 10000.0
+norm_eps: 1.0e-5

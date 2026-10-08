@@ -1,0 +1,25 @@
+# Dataset build configuration (python -m tinyperf.data.build --config configs/data.yaml)
+data:
+  out_dir: artifacts/data
+  n_train: 8000
+  n_val: 400
+  n_test_iid: 400
+  n_test_compositional: 300
+  n_test_heldout: 300
+  heldout_seed_frac: 0.15
+  n_test_seeds: 300
+  heldout_families: [dict_linear_search, materialize]
+  min_slowdown: 1.30
+  max_degradations: 3
+  train_depths: [1, 2]
+  max_nodes_per_seed: 60
+  max_source_chars: 2200
+  rename_prob: 0.8
+  perf_scale: 3000
+  seed: 0
+  natural_dir: null
+env:
+  max_parallel_envs: 48
+  timing:
+    repeats: 5
+    paired: true

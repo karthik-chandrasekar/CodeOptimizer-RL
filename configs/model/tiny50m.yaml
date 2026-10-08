@@ -1,0 +1,11 @@
+name: tinyperf-50m
+vocab_size: 8192
+n_layer: 12
+n_embd: 512
+n_head: 8
+mlp_dim: 2048
+max_seq_len: 2048
+dropout: 0.0
+tie_embeddings: true
+rope_theta: 10000.0
+norm_eps: 1.0e-5

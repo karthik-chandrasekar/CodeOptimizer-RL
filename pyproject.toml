@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinyperf-rl"
+version = "0.1.0"
+description = "TinyPerf-RL: a tiny code-only agent that learns Python performance optimization from execution feedback (V0)."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "tokenizers>=0.15",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+train = ["torch>=2.2"]
+teacher = ["anthropic>=0.30"]
+dev = ["pytest>=7.4"]
+
+[tool.setuptools.packages.find]
+include = ["tinyperf*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

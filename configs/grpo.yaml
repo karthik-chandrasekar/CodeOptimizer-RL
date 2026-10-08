@@ -1,0 +1,42 @@
+# Stage 3: GRPO in the execution-feedback environment  (python -m tinyperf.train.grpo --config configs/grpo.yaml)
+model: configs/model/tiny20m.yaml
+tokenizer:
+  path: artifacts/tokenizer/tokenizer.json
+grpo:
+  tasks: artifacts/data/train.jsonl
+  init_from: artifacts/sft/final.pt
+  out_dir: artifacts/grpo
+  group_size: 8          # G independent rollouts per function
+  tasks_per_step: 8      # B functions per optimizer step  (B*G = 64 episodes)
+  ppo_epochs: 1
+  minibatch_size: 16
+  clip_eps: 0.2
+  clip_eps_high: 0.28    # DAPO-style asymmetric clipping; set equal to clip_eps to disable
+  kl_beta: 0.0           # KL to the frozen SFT reference (k3 estimator); 0 disables
+  adv_norm: std          # std (GRPO) | none (Dr. GRPO: mean-centred only)
+  loss_agg: token        # token (DAPO) | sequence
+  max_steps: 2000
+  log_every: 1
+  eval_every: 50
+  save_every: 100
+  n_eval_tasks: 64
+  lr: 2.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  seed: 0
+  generation:
+    temperature: 0.8
+    top_p: 1.0
+    top_k: 0
+    max_new_tokens: 768
+env:
+  horizon: 6             # H  (ablation: 1, 2, 4, 6, 10)
+  improvement_delta: 0.03
+  feedback: full         # `none` = no-feedback control
+  max_parallel_envs: 16
+  timing:
+    repeats: 5
+reward:
+  step_penalty: 0.015    # lambda
+  invalid_penalty: 0.10  # mu (per incorrect / malformed / crashing edit)
+  clip_log_speedup: 4.0

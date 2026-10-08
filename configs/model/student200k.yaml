@@ -1,0 +1,10 @@
+# 197k-parameter student. An 8,192-token vocabulary would need ~197k parameters for embeddings alone at width 24,
+# so this student uses its own 1,024-token BPE; sequences are ~1.5x longer, hence the 4,096-token context.
+name: tinyperf-student-200k
+vocab_size: 1024
+n_layer: 4
+n_embd: 48
+n_head: 3
+mlp_dim: 192
+max_seq_len: 4096
+tie_embeddings: true

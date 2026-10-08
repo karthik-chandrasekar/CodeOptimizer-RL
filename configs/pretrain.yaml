@@ -1,0 +1,28 @@
+# Stage 1: code-only pretraining  (python -m tinyperf.train.pretrain --config configs/pretrain.yaml)
+model: configs/model/tiny20m.yaml
+tokenizer:
+  path: artifacts/tokenizer/tokenizer.json
+  vocab_size: 8192
+  corpus_dirs: []          # add directories of .py files (e.g. a Python subset of The Stack)
+  corpus_jsonl: []         # or jsonl files with a "content" field
+  include_stdlib: true     # the local CPython stdlib (~30MB of Python) is a free starter corpus
+  include_tasks: artifacts/data/train.jsonl
+pretrain:
+  seq_len: 1024
+  corpus_dirs: []
+  corpus_jsonl: []
+  include_stdlib: true
+  include_tasks: artifacts/data/train.jsonl
+  out_dir: artifacts/pretrain
+  eval_every: 500
+  save_every: 1000
+  log_every: 20
+  optim:
+    lr: 6.0e-4
+    min_lr: 6.0e-5
+    weight_decay: 0.1
+    warmup_steps: 300
+    max_steps: 20000
+    grad_clip: 1.0
+    batch_size: 32
+    grad_accum: 2

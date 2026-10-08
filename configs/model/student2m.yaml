@@ -1,0 +1,9 @@
+# 2.10M-parameter student (half of it the 8,192-token embedding table, shared with the teacher's tokenizer)
+name: tinyperf-student-2m
+vocab_size: 8192
+n_layer: 4
+n_embd: 128
+n_head: 4
+mlp_dim: 512
+max_seq_len: 2048
+tie_embeddings: true

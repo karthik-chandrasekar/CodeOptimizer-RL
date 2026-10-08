@@ -1,0 +1,28 @@
+# Stage 2b: agent SFT on (observation -> action) pairs  (python -m tinyperf.train.sft --config configs/sft.yaml)
+model: configs/model/tiny20m.yaml
+tokenizer:
+  path: artifacts/tokenizer/tokenizer.json
+sft:
+  trajectories: artifacts/sft/trajectories.jsonl
+  init_from: artifacts/pretrain/final.pt   # set to "" for the no-pretraining ablation
+  out_dir: artifacts/sft
+  seq_len: 2048
+  epochs: 3
+  methods: []                  # e.g. [programmatic] to ablate search-generated data
+  first_step_only: false       # true = SFT-1 (one-shot: s_0 -> final fast code) training set
+  mask_failed_actions: true    # imitate recovery from failures, not the failed edits themselves
+  val_frac: 0.03
+  eval_every: 200
+  save_every: 500
+  log_every: 20
+  optim:
+    lr: 1.0e-4
+    min_lr: 1.0e-5
+    weight_decay: 0.1
+    warmup_steps: 100
+    max_steps: 6000
+    grad_clip: 1.0
+    batch_size: 32
+    grad_accum: 1
+env:
+  feedback: full                     # `none` trains the no-feedback control (state block masked to step/remaining)

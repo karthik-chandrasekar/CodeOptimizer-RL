@@ -1,0 +1,27 @@
+# Evaluation  (python -m tinyperf.eval.evaluate --config configs/eval.yaml eval.tasks=artifacts/data/test_heldout.jsonl)
+model: configs/model/tiny20m.yaml
+tokenizer:
+  path: artifacts/tokenizer/tokenizer.json
+eval:
+  tasks: artifacts/data/test_iid.jsonl
+  checkpoint: artifacts/grpo/final.pt
+  out_path: artifacts/eval/results.json
+  n_tasks: 0             # 0 = all
+  n_samples: 1           # rollouts per task; metrics are averaged over samples
+  greedy: false
+  save_trajectories: true
+  generation:
+    temperature: 0.6
+    top_p: 1.0
+    top_k: 0
+    max_new_tokens: 768
+env:
+  horizon: 6
+  improvement_delta: 0.03
+  feedback: full
+  max_parallel_envs: 16
+  timing:
+    repeats: 7           # more repeats at eval time for tighter timing
+reward:
+  step_penalty: 0.015
+  invalid_penalty: 0.10
