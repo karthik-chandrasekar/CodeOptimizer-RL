@@ -1,0 +1,8 @@
+{"schema_version": "bundle_v1", "system_id": "R", "kind": "all_rules",
+ "notes": "Deterministic rule system (harness checks, data sanity, headroom diagnostics). Not a learned baseline.",
+ "roles": {
+   "M1": {"adapter": "rule", "rule": "hottest_self"},
+   "M2": {"adapter": "rule", "rule": "first_applicable"},
+   "M3": {"adapter": "rule", "rule": "programmatic"},
+   "M4": {"adapter": "rule", "rule": "transform_specific"},
+   "M5": {"adapter": "rule", "rule": "programmatic_repair"}}}

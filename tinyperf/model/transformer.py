@@ -137,12 +137,15 @@ class TinyPerfLM(nn.Module):
         return cos[positions], sin[positions]
 
     def forward(self, idx: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, positions: Optional[torch.Tensor] = None,
-                cache: Optional[List[Dict]] = None) -> torch.Tensor:
-        """idx: [B, T] -> logits [B, T, V].
+                cache: Optional[List[Dict]] = None, last_logits_only: bool = False) -> torch.Tensor:
+        """idx: [B, T] -> logits [B, T, V]  (or [B, 1, V] with ``last_logits_only``).
 
         attn_mask: optional bool [B, 1, T, S] (True = attend) for padded batches; when None a causal mask is used.
         positions: [T] or [B, T] absolute positions (per-row positions are needed for left-padded
                    batches / KV-cache decoding); defaults to arange(T).
+        last_logits_only: inference-only option: project only the final position to the vocabulary (a prefill of
+                   B x T tokens otherwise materialises a B x T x V logits tensor).  Training and token-level
+                   likelihoods need the default full output.
         """
         B, T = idx.shape
         if positions is None:
@@ -151,6 +154,8 @@ class TinyPerfLM(nn.Module):
         x = self.drop(self.wte(idx))
         for i, blk in enumerate(self.blocks):
             x = blk(x, cos, sin, attn_mask, None if cache is None else cache[i])
+        if last_logits_only:
+            x = x[:, -1:, :]
         return self.lm_head(self.ln_f(x))
 
     def new_cache(self) -> List[Dict]:

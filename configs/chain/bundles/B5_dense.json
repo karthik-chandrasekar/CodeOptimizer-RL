@@ -1,0 +1,9 @@
+{"schema_version": "bundle_v1", "system_id": "B5", "kind": "dense_10m_role_structured",
+ "tokenizer": "artifacts/tokenizer/tokenizer.json",
+ "notes": "Train with tinyperf_chain.train.sft --role shared --init <dense10m pretrained checkpoint>.",
+ "roles": {
+   "M1": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/dense_shared_sft/best.pt"},
+   "M2": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/dense_shared_sft/best.pt"},
+   "M3": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/dense_shared_sft/best.pt"},
+   "M4": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/dense_shared_sft/best.pt"},
+   "M5": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/dense_shared_sft/best.pt"}}}

@@ -1,0 +1,5 @@
+base: pilot.yaml
+training:
+  stage: sft
+  lr: 0.00002          # compare 1e-5 and 6e-5 on development data only
+  epochs: 3

@@ -1,0 +1,3 @@
+base: pilot.yaml
+serving:
+  episode_workers: 4

@@ -1,0 +1,8 @@
+{"schema_version": "bundle_v1", "system_id": "B3", "kind": "learned_writer_rule_aux",
+ "tokenizer": "artifacts/tokenizer/tokenizer.json",
+ "roles": {
+   "M1": {"adapter": "rule", "rule": "hottest_self"},
+   "M2": {"adapter": "rule", "rule": "first_applicable"},
+   "M3": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/M3_sft/best.pt"},
+   "M4": {"adapter": "rule", "rule": "transform_specific"},
+   "M5": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/M3_sft/best.pt", "prompt_role": "M5"}}}

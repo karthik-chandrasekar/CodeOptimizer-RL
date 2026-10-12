@@ -1,0 +1,102 @@
+# TinyPerf-Chain pilot configuration (strict schema: tinyperf_chain.config; NOT valid for the legacy loader).
+# Settings are proposed starting values; calibrate wall time, workers and batching on the actual machine.
+experiment:
+  name: tinyperf_chain_v1
+  seed: 17
+  bundle_frozen_per_episode: true
+  final_test_access: evaluator_only
+
+model:
+  seed_checkpoint: ${TINYPERF_CKPT}
+  tokenizer: ${TINYPERF_TOKENIZER}
+  context_tokens: 2048
+  add_special_tokens: false
+  full_model_finetuning: true
+
+roles:
+  M1: {max_input: 2016, max_output: 32, mode: greedy}
+  M2: {max_input: 1888, max_output: 160, mode: greedy}
+  M3: {max_input: 1408, max_output: 640, mode: sample, temperature: 0.6}
+  M4: {max_input: 1952, max_output: 96, mode: greedy}
+  M5: {max_input: 1408, max_output: 640, mode: sample, temperature: 0.6}
+
+budget:
+  patch_slots: 6
+  role_calls: 32
+  total_input_output_tokens: 20000
+  extra_probe_calls: 18
+  max_probes_per_candidate: 3
+  max_repairs_per_lineage: 1
+  max_plans_per_function_version: 2
+  max_profiles: 7
+  search_wall_seconds: null        # REQUIRED calibration (eval.run --calibrate-wall) before comparisons
+
+verification:
+  semantic_reference: immutable_original
+  online_private_feedback: category_only
+  final_audit_feedback: disabled
+  accept_incremental_speedup: 1.03
+  accept_rule: paired_log_median_ci_lower
+  timing_bootstrap_draws: 1000
+  timing_interval: 0.95
+  success_final_speedup: 1.50
+  train_timing_blocks: 5
+  development_timing_blocks: 15
+  audit_timing_blocks: 31
+  uncertain_timing_policy: reject
+  block_target_ms: 50.0
+  repairable_failures: [syntax_error, smoke_mismatch, probe_mismatch]
+  hash_seed: 0
+  audit_hash_seed: 1
+
+sandbox:
+  memory_mb: 768
+  call_timeout_s: 2.0
+  workload_timeout_s: 10.0
+  isolation: rlimits               # rlimits | unshare | bwrap (probed; never silently downgraded)
+  drop_to_uid: null                # e.g. 65534 when running as root
+  timing_cpus: []                  # reserved physical cores for timing workers, e.g. [2, 3]
+
+training:
+  stage: sft
+  lr: 0.00002
+  epochs: 3
+  microbatch: 4
+  accumulate: 8
+  loss: response_mean_per_example
+  gradient_clip: 1.0
+  checkpoint_every: 100
+  checkpoint_selection: development_only
+  precision: bf16_autocast
+
+rl:
+  roles: [M3, M5]
+  states_per_update: 2
+  group_size: 8
+  temperature: 0.8
+  max_updates: 100
+
+serving:
+  resident_roles: [M1, M2, M3, M4, M5]
+  eager_reference_enabled: true
+  compile_enabled: false
+  static_kv_cache: true
+  last_logits_only: true
+  correctness_workers: 2
+  timing_workers: 1
+  max_pending_candidates: 16
+  episode_workers: 4
+  device: auto
+
+data:
+  n_train_clusters: 300
+  n_dev_clusters: 60
+  n_confirm_clusters: 100
+  max_target_tokens: 384
+  plans_per_function: 3
+  patches_per_plan: 2
+  n_files_per_split: {train: 400, dev: 60, confirm: 100}
+  workers: 8
+
+paths:
+  root: artifacts/chain

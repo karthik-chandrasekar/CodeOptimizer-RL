@@ -1,0 +1,3 @@
+base: pilot.yaml
+budget:
+  search_wall_seconds: 120.0     # replace with the calibrated value from the development calibration run

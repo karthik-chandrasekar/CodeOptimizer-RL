@@ -128,6 +128,13 @@ the paired tables. Notes:
   (`VLLM_GPU_UTIL=0.92`) with nothing else running on it.
 * Hugging Face weights are cached under `HF_HOME`.
 
+## TinyPerf-Chain extension
+
+`tinyperf_chain/` implements the five-role (M1-M5) chain specification on top of this code base: typed role
+interfaces, a budgeted deterministic controller, a stricter verifier, the data factory, role trainers, an inference
+engine with a static KV cache, and paired whole-policy evaluation.  See `tinyperf_chain/README.md` for the runbook;
+`pytest tests/chain` and `bash scripts/chain/smoke.sh` exercise it on CPU.
+
 ## Notes
 
 * `tinyperf/train/sft_data.py` also contains an optional LLM-API trajectory proposer (`sft_data.methods`

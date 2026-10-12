@@ -1,0 +1,10 @@
+base: pilot.yaml
+rl:
+  roles: [M3, M5]
+  states_per_update: 2
+  group_size: 8
+  temperature: 0.8
+  top_k: 0
+  top_p: 1.0
+  max_updates: 100
+  lr: 0.00002

@@ -1,0 +1,9 @@
+{"schema_version": "bundle_v1", "system_id": "B6", "kind": "existing_22m_adapted",
+ "tokenizer": "artifacts/tokenizer/tokenizer.json",
+ "notes": "The existing 22M checkpoint adapted to the same role interfaces (sft --role shared --init <22M ckpt>, model expectations overridden).",
+ "roles": {
+   "M1": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/t22m_shared_sft/best.pt"},
+   "M2": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/t22m_shared_sft/best.pt"},
+   "M3": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/t22m_shared_sft/best.pt"},
+   "M4": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/t22m_shared_sft/best.pt"},
+   "M5": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/t22m_shared_sft/best.pt"}}}

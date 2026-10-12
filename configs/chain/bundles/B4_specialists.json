@@ -1,0 +1,8 @@
+{"schema_version": "bundle_v1", "system_id": "B4", "kind": "five_role_specialists",
+ "tokenizer": "artifacts/tokenizer/tokenizer.json",
+ "roles": {
+   "M1": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/M1_sft/best.pt"},
+   "M2": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/M2_sft/best.pt"},
+   "M3": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/M3_sft/best.pt"},
+   "M4": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/M4_sft/best.pt"},
+   "M5": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/M5_sft/best.pt"}}}

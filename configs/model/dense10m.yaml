@@ -1,0 +1,11 @@
+# Dense total-parameter control for the five-role bank (B5): 10,490,112 parameters by eq. (1),
+# 1,408 fewer than five 2,098,304-parameter students.  Needs its own code pretraining / distillation history,
+# which is reported and charged separately (it does not inherit the students' training history).
+name: tinyperf-dense-10m
+vocab_size: 8192
+n_layer: 8
+n_embd: 256
+n_head: 8
+mlp_dim: 1024
+max_seq_len: 2048
+tie_embeddings: true

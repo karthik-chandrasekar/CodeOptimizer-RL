@@ -1,0 +1,9 @@
+{"schema_version": "bundle_v1", "system_id": "B2", "kind": "five_generalist_branches",
+ "tokenizer": "artifacts/tokenizer/tokenizer.json",
+ "notes": "Five branches each trained on the union of role data (sft --role shared, training.seed=1..5); fixed role assignment.",
+ "roles": {
+   "M1": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/shared_sft_seed1/best.pt"},
+   "M2": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/shared_sft_seed2/best.pt"},
+   "M3": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/shared_sft_seed3/best.pt"},
+   "M4": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/shared_sft_seed4/best.pt"},
+   "M5": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/shared_sft_seed5/best.pt"}}}

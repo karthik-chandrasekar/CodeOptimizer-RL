@@ -1,0 +1,8 @@
+{"schema_version": "bundle_v1", "system_id": "B1", "kind": "shared_role_2m",
+ "tokenizer": "artifacts/tokenizer/tokenizer.json",
+ "roles": {
+   "M1": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/shared_sft/best.pt"},
+   "M2": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/shared_sft/best.pt"},
+   "M3": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/shared_sft/best.pt"},
+   "M4": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/shared_sft/best.pt"},
+   "M5": {"adapter": "neural", "checkpoint": "artifacts/chain/checkpoints/shared_sft/best.pt"}}}

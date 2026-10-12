@@ -1,0 +1,9 @@
+{"schema_version": "bundle_v1", "system_id": "M0", "kind": "milestone_rule_target_plan_legacy_writer",
+ "tokenizer": "${TINYPERF_TOKENIZER}",
+ "notes": "First runnable milestone: rule targeting/planning + the existing writer + verifier + trace recorder.",
+ "roles": {
+   "M1": {"adapter": "rule", "rule": "hottest_self"},
+   "M2": {"adapter": "rule", "rule": "first_applicable"},
+   "M3": {"adapter": "legacy_writer", "checkpoint": "${TINYPERF_CKPT}", "temperature": 0.6},
+   "M4": {"adapter": "rule", "rule": "fixed_edge"},
+   "M5": {"adapter": "rule", "rule": "programmatic_repair"}}}

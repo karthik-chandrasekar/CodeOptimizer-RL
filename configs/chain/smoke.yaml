@@ -1,0 +1,43 @@
+# CPU smoke configuration: tiny budgets and timing blocks so the whole pipeline runs in minutes.
+base: pilot.yaml
+model:
+  expect_n_embd: 32
+  expect_n_layer: 2
+  expect_n_head: 2
+  expect_mlp_dim: 64
+  expect_vocab_size: 1024
+verification:
+  train_timing_blocks: 3
+  development_timing_blocks: 3
+  audit_timing_blocks: 5
+  block_target_ms: 3.0
+  timing_bootstrap_draws: 200
+training:
+  microbatch: 2
+  accumulate: 2
+  epochs: 1
+  checkpoint_every: 5
+  eval_every: 0
+  dev_generation_eval_max: 4
+  precision: fp32
+  max_updates: 6
+  lr: 0.001
+rl:
+  states_per_update: 1
+  group_size: 2
+  max_updates: 1
+  ratio_tolerance: 0.001
+serving:
+  episode_workers: 1
+  device: cpu
+data:
+  n_train_clusters: 300
+  n_dev_clusters: 60
+  n_confirm_clusters: 100
+  perf_scale: 400
+  n_perf: 2
+  plans_per_function: 2
+  patches_per_plan: 1
+  n_files_per_split: {train: 4, dev: 3, confirm: 2}
+  max_states_per_file: 1
+  workers: 2
