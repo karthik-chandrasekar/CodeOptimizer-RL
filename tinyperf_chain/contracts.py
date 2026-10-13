@@ -307,7 +307,18 @@ class TaskContract:
                     out.append(f"untyped_param:{f.name}.{p.name}")
         if self.aliasing != "none":
             out.append("aliasing_not_supported_v1")
+        # The verifier implements exactly one policy per field in v1.  A contract that declares another is a
+        # task/contract mismatch and is rejected at construction, never silently run under the default (3.1, 13.1).
+        for fld, supported in (("external_state", ("forbidden",)), ("return_policy", ("exact_type",)),
+                               ("exception_policy", ("type_only",)), ("mutation_policy", ("observe_all_args",)),
+                               ("dict_order", ("ignore",)), ("float_policy", ("deferred",))):
+            if getattr(self, fld) not in supported:
+                out.append(f"{fld}_{getattr(self, fld)}_not_supported_v1")
         return out
+
+    SUPPORTED_POLICIES = {"external_state": "forbidden", "return_policy": "exact_type", "exception_policy": "type_only",
+                          "mutation_policy": "observe_all_args", "dict_order": "ignore", "float_policy": "deferred",
+                          "aliasing": "none"}
 
     def supported(self) -> bool:
         return not self.unsupported_reasons()

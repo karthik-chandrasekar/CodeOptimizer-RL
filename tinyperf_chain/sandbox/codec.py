@@ -31,6 +31,8 @@ import json
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
+CODEC_VERSION = "plain_value_v1"   # part of every cache key; bump when the encoding or comparison changes
+
 
 class CodecError(Exception):
     """Value cannot be encoded under the plain-value contract (unsupported type, too large, too deep)."""

@@ -112,8 +112,10 @@ class BudgetLedger:
         return r is None or r > max(0.0, self.cfg.min_call_seconds)
 
     # -------------------------------------------------------------- #
-    def reserve_call(self, role: str, prompt_tokens: int, max_new_tokens: int) -> Reservation:
-        """Atomically charge a role call (+ a patch slot for M3/M5) and reserve tokens. Raises on refusal."""
+    def reserve_call(self, role: str, prompt_tokens: int, max_new_tokens: int, label: Optional[str] = None) -> Reservation:
+        """Atomically charge a role call (+ a patch slot for M3/M5) and reserve tokens. Raises on refusal.
+        ``label`` is the per-role bookkeeping key when it differs from the slot role (B0's direct edits are charged
+        like M3 writes but attributed to ``legacy``)."""
         self.check_deadline(f"before {role} call")
         patch = role in ("M3", "M5")
         with self._lock:
@@ -125,7 +127,8 @@ class BudgetLedger:
             if self.tokens_left() < need:
                 raise BudgetExhausted("token")
             self.used.role_calls += 1
-            self.used.calls_by_role[role] = self.used.calls_by_role.get(role, 0) + 1
+            key = label or role
+            self.used.calls_by_role[key] = self.used.calls_by_role.get(key, 0) + 1
             if patch:
                 self.used.patch_slots += 1
             self.used.reserved_tokens += need

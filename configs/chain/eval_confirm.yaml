@@ -1,3 +1,6 @@
+# Confirmation suite: locked bundles, unchanged environment, and a wall-time cap that MUST be calibrated on the
+# development suite first (eval.run --calibrate-wall writes calibration.json with a suggested value).  A null cap is
+# refused by validation for eval:confirmation on purpose: never run the locked comparison with a guessed budget.
 base: pilot.yaml
 budget:
-  search_wall_seconds: 120.0     # replace with the calibrated value from the development calibration run
+  search_wall_seconds: null    # REQUIRED: set from artifacts/chain/runs/calibration/calibration.json

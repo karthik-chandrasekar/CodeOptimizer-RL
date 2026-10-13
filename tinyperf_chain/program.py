@@ -136,16 +136,213 @@ def free_names(fn: ast.FunctionDef) -> Set[str]:
 
 
 def _base_name(node: ast.AST) -> Optional[str]:
-    while isinstance(node, (ast.Attribute, ast.Subscript)):
+    while isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred, ast.NamedExpr)):
         node = node.value
     return node.id if isinstance(node, ast.Name) else None
 
 
+# Builtins that never mutate their arguments: a module-level object may be passed to these.
+_PURE_BUILTINS = frozenset({
+    "len", "sorted", "list", "tuple", "set", "frozenset", "dict", "iter", "enumerate", "zip", "reversed", "sum", "min",
+    "max", "any", "all", "isinstance", "issubclass", "repr", "str", "bool", "int", "float", "complex", "map", "filter",
+    "hash", "id", "abs", "round", "range", "format", "ascii", "bin", "hex", "oct", "chr", "ord", "divmod", "pow",
+    "callable", "bytes", "slice", "hasattr",
+})
+# Functions of permitted modules that mutate their (first) argument, or whose module is treated as opaque: a
+# module-level object may not be handed to them.  Modules not listed in _PURE_MODULES are opaque too.
+_MODULE_MUTATORS = {
+    "heapq": {"heappush", "heappop", "heapify", "heappushpop", "heapreplace", "merge"},
+    "bisect": {"insort", "insort_left", "insort_right"},
+    "operator": {"setitem", "delitem", "setattr", "delattr", "iadd", "isub", "imul", "ior", "iand", "ixor", "ilshift",
+                 "irshift", "imod", "ipow", "itruediv", "ifloordiv", "imatmul", "iconcat", "methodcaller", "attrgetter",
+                 "itemgetter"},
+    "random": {"shuffle"},
+    "array": set(),
+}
+_PURE_MODULES = frozenset({"math", "itertools", "functools", "string", "re", "statistics", "fractions", "decimal", "collections",
+                           "copy", "json"})
+_DUNDER_MUTATORS = frozenset({
+    "__setitem__", "__delitem__", "__setattr__", "__delattr__", "__iadd__", "__isub__", "__imul__", "__ior__",
+    "__iand__", "__ixor__", "__ilshift__", "__irshift__", "__imod__", "__ipow__", "__itruediv__", "__ifloordiv__",
+    "__imatmul__", "__enter__", "__exit__",
+})
+_MUTATORS = frozenset(MUTATING_METHODS) | _DUNDER_MUTATORS
+_BUILTIN_TYPES = frozenset({"dict", "list", "set", "bytearray", "object", "type", "frozenset", "str", "tuple"})
+
+
+def _targets(node: ast.AST) -> List[ast.AST]:
+    if isinstance(node, (ast.Tuple, ast.List)):
+        out: List[ast.AST] = []
+        for e in node.elts:
+            out += _targets(e)
+        return out
+    if isinstance(node, ast.Starred):
+        return _targets(node.value)
+    return [node]
+
+
+_CONTAINER_BUILTINS = frozenset({"list", "tuple", "set", "frozenset", "dict", "sorted", "reversed", "iter", "enumerate",
+                                 "zip", "map", "filter"})
+_ELEMENT_BUILTINS = frozenset({"min", "max", "next"})
+_INTERIOR_METHODS = frozenset({"get", "setdefault", "pop", "popitem", "values", "items", "keys", "copy", "__getitem__"})
+
+
+def module_aliases(fn: ast.FunctionDef, module: Dict[str, str], bound: Set[str]) -> Tuple[Set[str], Dict[str, int]]:
+    """Local names that may reach a module-level object.
+
+    Returns ``(aliases, holders)``.  An *alias* (level 0) may be a module object or an interior part of one
+    (``c = CACHE``, ``row = TABLE[i]``, ``for k in TABLE``, ``v = CACHE.get(k)``, ``m = min(TABLE)``).  A *holder*
+    of level ``k >= 1`` is a fresh container with ``k`` layers of fresh containers above module-interior objects
+    (``rows = list(TABLE)`` is level 1: its elements are aliases; ``rows = [list(r) for r in TABLE]`` is level 2).
+    Mutating a holder's own layers is fine; reaching below them (``rows[i].append``, ``rows[i][j] = v`` at level 1)
+    is a write into module state.  A fixed point over assignments, loop/comprehension targets, with-items and
+    walrus expressions; augmented assignment does not propagate (``total += TABLE[i]`` is a read); reading through
+    an alias is always allowed."""
+    protected = {n for n, k in module.items() if k == "constant"} - bound
+    aliases: Set[str] = set()
+    holders: Dict[str, int] = {}
+
+    def lvl(value: Optional[ast.AST]) -> Optional[int]:
+        """None (unrelated), 0 (alias) or k >= 1 (holder level) for the object a value expression produces."""
+        if value is None:
+            return None
+        if isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+            ks = [k for k in (lvl(e) for e in value.elts) if k is not None]
+            return (max(ks) + 1) if ks else None      # a literal container one layer above its elements
+        if isinstance(value, ast.Dict):
+            ks = [k for k in (lvl(e) for e in list(value.keys) + list(value.values) if e is not None) if k is not None]
+            return (max(ks) + 1) if ks else None
+        if isinstance(value, (ast.IfExp, ast.BoolOp)):
+            parts = [value.body, value.orelse] if isinstance(value, ast.IfExp) else list(value.values)
+            ks = [k for k in (lvl(e) for e in parts) if k is not None]
+            return min(ks) if ks else None            # the most exposed branch decides
+        if isinstance(value, (ast.NamedExpr, ast.Starred)):
+            return lvl(value.value)
+        if isinstance(value, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            k = lvl(value.elt)
+            return None if k is None else k + 1
+        if isinstance(value, ast.DictComp):
+            ks = [k for k in (lvl(value.key), lvl(value.value)) if k is not None]
+            return (min(ks) + 1) if ks else None
+        if isinstance(value, ast.Call):
+            if isinstance(value.func, ast.Attribute):
+                recv = lvl(value.func.value)
+                if recv is None:
+                    return None
+                if value.func.attr == "copy":
+                    return max(1, recv)                # shallow copy: same elements, one fresh layer
+                if value.func.attr in _INTERIOR_METHODS:
+                    return max(0, recv - 1)            # takes an element out
+                return None                            # other methods (split, count, lower, ...) return fresh scalars/containers
+            if isinstance(value.func, ast.Name):
+                ks = [k for k in (lvl(a) for a in value.args) if k is not None]
+                if not ks:
+                    return None
+                if value.func.id == "getattr":
+                    return 0                           # a bound method / attribute of a module object is the object
+                if value.func.id in _CONTAINER_BUILTINS:
+                    return max(1, min(ks))             # same elements in a fresh container
+                if value.func.id in _ELEMENT_BUILTINS:
+                    return max(0, min(ks) - 1)         # one element out
+                if value.func.id in _PURE_BUILTINS:
+                    return None                        # scalar-producing builtins
+                return min(ks)                         # unknown callee: assume it may return its argument
+            return None
+        if isinstance(value, ast.Subscript):
+            base = lvl(value.value)
+            if base is None:
+                return None
+            if isinstance(value.slice, ast.Slice):
+                return max(1, base)                    # a slice is a fresh container of the same elements
+            return max(0, base - 1)
+        if isinstance(value, ast.Attribute):
+            return lvl(value.value)
+        if isinstance(value, ast.Name):
+            if value.id in aliases or (value.id in protected and value.id not in bound):
+                return 0
+            if value.id in holders:
+                return holders[value.id]
+            return None
+        return None
+
+    def element_lvl(value: Optional[ast.AST]) -> Optional[int]:
+        """What iterating over ``value`` yields."""
+        k = lvl(value)
+        return None if k is None else max(0, k - 1)
+
+    changed = True
+    while changed:
+        changed = False
+        for n in ast.walk(fn):
+            pairs: List[Tuple[ast.AST, Optional[int]]] = []
+            if isinstance(n, ast.Assign):
+                pairs = [(t, lvl(n.value)) for t in n.targets]
+            elif isinstance(n, ast.AnnAssign):
+                pairs = [(n.target, lvl(n.value))]
+            elif isinstance(n, ast.NamedExpr):
+                pairs = [(n.target, lvl(n.value))]
+            elif isinstance(n, (ast.For, ast.comprehension)):
+                pairs = [(n.target, element_lvl(n.iter))]
+            elif isinstance(n, ast.withitem) and n.optional_vars is not None:
+                pairs = [(n.optional_vars, lvl(n.context_expr))]
+            for target, k in pairs:
+                if k is None:
+                    continue
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    k = max(0, k - 1)                  # unpacking takes elements out
+                for t in _targets(target):
+                    if not isinstance(t, ast.Name):
+                        continue
+                    if k == 0:
+                        if t.id not in aliases:
+                            aliases.add(t.id)
+                            holders.pop(t.id, None)
+                            changed = True
+                    elif t.id not in aliases and holders.get(t.id, 1 << 30) > k:
+                        holders[t.id] = k              # keep the most exposed level seen for the name
+                        changed = True
+    return aliases, holders
+
+
+def _base_and_depth(node: ast.AST) -> Tuple[Optional[str], int]:
+    """Base name of an attribute/subscript chain and the number of non-slice hops (``rows[0].x`` -> ('rows', 2))."""
+    depth = 0
+    while isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred, ast.NamedExpr)):
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            depth += 0            # a slice is a fresh container; it does not reach an interior object
+        elif isinstance(node, (ast.Attribute, ast.Subscript)):
+            depth += 1
+        node = node.value
+    return (node.id if isinstance(node, ast.Name) else None), depth
+
+
 def check_function_scope(fn: ast.FunctionDef, program: Program, permitted_imports: Sequence[str]) -> None:
-    """Raise PatchError if ``fn`` violates the patch policy relative to ``program``'s module scope."""
+    """Raise PatchError if ``fn`` violates the patch policy relative to ``program``'s module scope.
+
+    Module-level objects (constants, functions, imported modules) are read-only for a patch: no stores, deletes,
+    augmented assignments or mutating method calls on them *or on any local alias of them*, and no handing them to
+    callables other than pure builtins or the program's own module-level functions.  Together with the sandbox's
+    fresh namespace per trial this closes the memoisation / hidden-state route to a fake speedup."""
     module = program.module_names
     bound = locally_bound(fn)
     permitted = set(permitted_imports)
+    aliases, holders = module_aliases(fn, module, bound)
+    protected_consts = {n for n, k in module.items() if k == "constant"} - bound
+
+    def guarded(name: Optional[str]) -> bool:
+        """Is ``name`` a module-level object or a local alias of one?"""
+        if name is None:
+            return False
+        if name in aliases:
+            return True
+        return name not in bound and name in module
+
+    def interior(node: ast.AST, extra: int) -> Optional[str]:
+        """Name of a holder whose module-interior objects ``node`` reaches: ``extra`` is 0 for a mutating-method
+        receiver (``rows[i].append`` at level 1) and 1 for a store target (``rows[i][j] = v`` at level 1)."""
+        b, d = _base_and_depth(node)
+        return b if (b in holders and d >= holders[b] + extra) else None
+
     for n in ast.walk(fn):
         if isinstance(n, (ast.Global, ast.Nonlocal)):
             raise PatchError("policy_violation", "global/nonlocal statements are not allowed")
@@ -162,19 +359,57 @@ def check_function_scope(fn: ast.FunctionDef, program: Program, permitted_import
         if isinstance(n, ast.ImportFrom):
             if n.level or (n.module or "").split(".")[0] not in permitted:
                 raise PatchError("scope_violation", f"undeclared import from {n.module!r}")
-        # writes to module-level state
+        # writes to module-level state, directly or through an alias
         if isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, (ast.Store, ast.Del)):
             b = _base_name(n)
-            if b is not None and b not in bound and b in module:
+            if guarded(b):
                 raise PatchError("policy_violation", f"writes to module-level object {b!r}")
+            h = interior(n, 1)                        # rows[i][j] = v writes into a module-interior object
+            if h is not None:
+                raise PatchError("policy_violation", f"writes into a module-level object held by {h!r}")
         if isinstance(n, ast.AugAssign):
             b = _base_name(n.target)
-            if b is not None and b not in bound and b in module:
+            if guarded(b) or (isinstance(n.target, ast.Name) and n.target.id in aliases):
                 raise PatchError("policy_violation", f"writes to module-level object {b!r}")
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in MUTATING_METHODS:
-            b = _base_name(n.func.value)
-            if b is not None and b not in bound and module.get(b) == "constant":
-                raise PatchError("policy_violation", f"mutates module-level object {b!r}")
+            h = interior(n.target, 1)
+            if h is not None:
+                raise PatchError("policy_violation", f"writes into a module-level object held by {h!r}")
+        if isinstance(n, ast.Call):
+            if isinstance(n.func, ast.Attribute):
+                recv = _base_name(n.func.value)
+                if n.func.attr in _MUTATORS and guarded(recv):
+                    raise PatchError("policy_violation", f"mutates module-level object {recv!r}")
+                if n.func.attr in _MUTATORS and interior(n.func.value, 0) is not None:
+                    raise PatchError("policy_violation", f"mutates a module-level object held by {recv!r}")
+                # unbound-method form: dict.update(CACHE, ...), list.append(TABLE, x)
+                if recv in _BUILTIN_TYPES and recv not in bound and n.func.attr in _MUTATORS and n.args:
+                    first = _base_name(n.args[0])
+                    if guarded(first):
+                        raise PatchError("policy_violation", f"mutates module-level object {first!r} via {recv}.{n.func.attr}")
+            callee = n.func.id if isinstance(n.func, ast.Name) else None
+            if callee == "getattr" and n.args:
+                b = _base_name(n.args[0])
+                if guarded(b) or interior(n.args[0], 0) is not None:
+                    attr = n.args[1].value if len(n.args) > 1 and isinstance(n.args[1], ast.Constant) else None
+                    if attr is None or attr in _MUTATORS:
+                        raise PatchError("policy_violation", f"getattr on module-level object {b!r} with a mutating attribute")
+            elif callee is not None and callee not in _PURE_BUILTINS and not (module.get(callee) == "function" and callee not in bound):
+                for a in list(n.args) + [k.value for k in n.keywords]:
+                    b = _base_name(a)
+                    if b is not None and (b in protected_consts or b in aliases):
+                        raise PatchError("policy_violation", f"module-level object {b!r} may not be passed to {callee}()")
+            if isinstance(n.func, ast.Attribute):
+                # module function: heapq.heappush(TABLE, x), operator.setitem(CACHE, k, v), unknown.module.f(CACHE)
+                mod_name = n.func.value.id if isinstance(n.func.value, ast.Name) else None
+                if mod_name is not None and mod_name not in bound and module.get(mod_name) == "import":
+                    fname = n.func.attr
+                    opaque = mod_name not in _PURE_MODULES
+                    mutating = fname in _MODULE_MUTATORS.get(mod_name, set())
+                    if opaque or mutating:
+                        for a in list(n.args) + [k.value for k in n.keywords]:
+                            b = _base_name(a)
+                            if guarded(b) or interior(a, 0) is not None:
+                                raise PatchError("policy_violation", f"module-level object {b!r} may not be passed to {mod_name}.{fname}()")
     for name in free_names(fn):
         if name in SAFE_BUILTINS or name in module:
             continue
@@ -253,6 +488,25 @@ class Closure:
             if isinstance(n, (ast.Assign, ast.AnnAssign, ast.Import, ast.ImportFrom)):
                 parts.append(ast.unparse(n))
         return sha256_text("\n".join(parts))
+
+
+def dependency_sources(program: Program, closure: "Closure") -> List[str]:
+    """Source text of everything in the closure a writer needs to see (4.4): the imports and module-level constants
+    the target (transitively) references, then the referenced module-level functions, in program order."""
+    out: List[str] = []
+    for n in program.tree.body:
+        if isinstance(n, ast.Import) and any((a.asname or a.name).split(".")[0] in closure.imports for a in n.names):
+            out.append(ast.unparse(n))
+        elif isinstance(n, ast.ImportFrom) and any((a.asname or a.name) in closure.imports for a in n.names):
+            out.append(ast.unparse(n))
+        elif isinstance(n, (ast.Assign, ast.AnnAssign)):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            names = {x.id for t in targets for x in ast.walk(t) if isinstance(x, ast.Name)}
+            if names & set(closure.constants):
+                out.append(ast.unparse(n))
+    for f in closure.functions:
+        out.append(program.function_source(f).rstrip("\n"))
+    return out
 
 
 _DYNAMIC = {"getattr", "hasattr", "setattr", "delattr", "eval", "exec", "globals", "locals", "vars", "__import__"}

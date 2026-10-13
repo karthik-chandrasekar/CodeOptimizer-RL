@@ -471,33 +471,44 @@ class PlanCheck:
     ok: bool
     reason: str = ""
     sites: List[Site] = field(default_factory=list)
+    kind: str = "ok"      # unknown_transform | wrong_operand | unknown_preserve | no_site | precondition_rejected
 
 
 def validate_plan(plan: Plan, fn: ast.FunctionDef, fcontract: Optional[FunctionContract]) -> PlanCheck:
+    """Trusted applicability check of a plan against the current function and its contract (6.2: a plan cannot
+    certify its own preconditions).  ``kind`` classifies rejections so wrong-operand and rejected-precondition rates
+    can be reported separately (6.3)."""
     if plan.transform_id not in MECHANISMS:
-        return PlanCheck(False, f"unknown transform {plan.transform_id!r}")
+        return PlanCheck(False, f"unknown transform {plan.transform_id!r}", kind="unknown_transform")
     m = MECHANISMS[plan.transform_id]
     names = set(operand_names(fn))
     anchor_ids = {a.id for a in anchors(fn)}
     for o in plan.operands:
         k, _, v = o.partition("=")
         if k not in m.operands:
-            return PlanCheck(False, f"operand {k!r} is not legal for {m.id}")
+            return PlanCheck(False, f"operand {k!r} is not legal for {m.id}", kind="wrong_operand")
         if k == "src" and v not in names:
-            return PlanCheck(False, f"src={v} is not a name in the function")
+            return PlanCheck(False, f"src={v} is not a name in the function", kind="wrong_operand")
         if k == "loop" and v not in anchor_ids:
-            return PlanCheck(False, f"loop={v} is not an anchor of the function")
+            return PlanCheck(False, f"loop={v} is not an anchor of the function", kind="wrong_operand")
     for p in plan.preserve:
         if p not in PRESERVE_VALUES:
-            return PlanCheck(False, f"unknown preserve value {p!r}")
+            return PlanCheck(False, f"unknown preserve value {p!r}", kind="unknown_preserve")
     sites = sites_for(fn, m.id)
     src, loop = plan.operand("src"), plan.operand("loop")
     matching = [s for s in sites if (src is None or s.src == src) and (loop is None or s.loop == loop)]
     if not matching:
-        return PlanCheck(False, "no applicable site matches the operands")
+        return PlanCheck(False, "no applicable site matches the operands", kind="no_site" if sites else "inapplicable")
     pre = check_preconditions(m.id, src or matching[0].src, fcontract)
     if pre:
-        return PlanCheck(False, f"precondition: {pre}")
+        return PlanCheck(False, f"precondition: {pre}", kind="precondition_rejected")
+    if m.id == "loop_invariant_hoist":
+        # representable static precondition (6.2): the hoisted operand is not rebound inside the loop
+        info = _FnInfo(fn)
+        for s in matching:
+            node = info.anchor_node(s.loop) if s.loop else None
+            if node is not None and s.src in set(stored_names(node)):
+                return PlanCheck(False, f"precondition: {s.src} is assigned inside {s.loop}", kind="precondition_rejected")
     return PlanCheck(True, "", matching)
 
 
@@ -557,8 +568,94 @@ def site_in_change(site: Site, info: _FnInfo, changed: Sequence[ast.stmt]) -> bo
     return False
 
 
-def extract_plan(old_fn_src: str, new_fn_src: str, mechanism: str, function_id: str = "") -> Optional[Plan]:
-    """Operands of the plan a verified rewrite instantiates (training labels for M2/M3)."""
+def _calls(fn: ast.AST, names: Sequence[str]) -> List[ast.Call]:
+    return [n for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in names]
+
+
+def _method_calls(fn: ast.AST, attr: str) -> List[ast.Call]:
+    return [n for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == attr]
+
+
+def _in_loop(info: _FnInfo, node: ast.AST) -> bool:
+    return info.enclosing_loop(node) is not None
+
+
+def _hashed_ctor_count(fn: ast.AST) -> int:
+    n = 0
+    for x in ast.walk(fn):
+        if isinstance(x, (ast.Set, ast.SetComp, ast.Dict, ast.DictComp)):
+            n += 1
+        elif isinstance(x, ast.Call) and isinstance(x.func, ast.Name) and x.func.id in _HASHED_CTORS:
+            n += 1
+    return n
+
+
+def plan_adherence(mechanism: str, old_fn: ast.FunctionDef, new_fn: ast.FunctionDef, site: Optional[Site] = None) -> bool:
+    """Does ``new_fn`` structurally *realise* ``mechanism`` relative to ``old_fn``?  Site overlap alone would label
+    any algorithmic rewrite that touches a loop with whatever mechanism has a site there (e.g. Kadane's algorithm
+    as a 'hoist'); each mechanism therefore needs its signature construct to appear (6.2, 10.3 'correct operands')."""
+    oi, ni = _FnInfo(old_fn), _FnInfo(new_fn)
+    if mechanism == "membership_index":
+        if _hashed_ctor_count(new_fn) <= _hashed_ctor_count(old_fn):
+            return False
+        new_hashed = _hashed_locals(new_fn)
+        for n in ast.walk(new_fn):
+            if isinstance(n, ast.Compare) and any(isinstance(op, (ast.In, ast.NotIn)) for op in n.ops) and \
+                    any(_name(c) in new_hashed for c in n.comparators):
+                return True
+            if isinstance(n, ast.Subscript) and _name(n.value) in new_hashed:
+                return True
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get" and _name(n.func.value) in new_hashed:
+                return True
+        return False
+    if mechanism == "sequence_builder":
+        old_concat = sum(1 for s in _sites_sequence_builder(oi) if s.detail == "concat_append")
+        new_concat = sum(1 for s in _sites_sequence_builder(ni) if s.detail == "concat_append")
+        old_app = sum(1 for c in _method_calls(old_fn, "append") if _in_loop(oi, c))
+        new_app = sum(1 for c in _method_calls(new_fn, "append") if _in_loop(ni, c))
+        old_comp = sum(1 for n in ast.walk(old_fn) if isinstance(n, (ast.ListComp, ast.GeneratorExp)))
+        new_comp = sum(1 for n in ast.walk(new_fn) if isinstance(n, (ast.ListComp, ast.GeneratorExp)))
+        if new_concat < old_concat:
+            return True                                    # concatenation replaced by append / comprehension
+        return new_app < old_app and new_comp > old_comp   # append loop replaced by a comprehension
+    if mechanism == "string_join":
+        return len(_method_calls(new_fn, "join")) > len(_method_calls(old_fn, "join"))
+    if mechanism == "builtin_reduction":
+        red = ("sum", "any", "all", "min", "max")
+        return len(_calls(new_fn, red)) > len(_calls(old_fn, red)) and \
+            sum(1 for n in ast.walk(new_fn) if isinstance(n, ast.For)) < sum(1 for n in ast.walk(old_fn) if isinstance(n, ast.For))
+    if mechanism == "loop_invariant_hoist":
+        def inv_calls(fn: ast.FunctionDef, info: _FnInfo):
+            inside, outside = [], []
+            for c in _calls(fn, list(PURE_BUILTIN_CALLS)):
+                (inside if _in_loop(info, c) else outside).append(ast.dump(c))
+            return inside, outside
+        oi_in, oi_out = inv_calls(old_fn, oi)
+        ni_in, ni_out = inv_calls(new_fn, ni)
+        moved = [d for d in oi_in if d not in ni_in and d in ni_out]
+        return bool(moved) or (len(ni_in) < len(oi_in) and len(ni_out) > len(oi_out))
+    if mechanism == "scan_fusion":
+        old_counts = sum(1 for c in _method_calls(old_fn, "count") if _in_loop(oi, c))
+        new_counts = sum(1 for c in _method_calls(new_fn, "count") if _in_loop(ni, c))
+        return new_counts < old_counts
+    if mechanism == "selection_vs_sorting":
+        old_sorted = len(_sites_selection(oi))
+        new_sorted = len(_sites_selection(ni))
+        return new_sorted < old_sorted and len(_calls(new_fn, ("min", "max"))) > len(_calls(old_fn, ("min", "max")))
+    if mechanism == "allocation_reduction":
+        old_mat = sum(1 for s in _sites_allocation(oi))
+        new_mat = sum(1 for s in _sites_allocation(ni))
+        new_gen = sum(1 for n in ast.walk(new_fn) if isinstance(n, ast.GeneratorExp))
+        old_gen = sum(1 for n in ast.walk(old_fn) if isinstance(n, ast.GeneratorExp))
+        return new_mat < old_mat and (new_gen > old_gen or len(_method_calls(new_fn, "append")) > len(_method_calls(old_fn, "append"))
+                                      or len(_method_calls(new_fn, "setdefault")) > len(_method_calls(old_fn, "setdefault")))
+    return False
+
+
+def extract_plan(old_fn_src: str, new_fn_src: str, mechanism: str, function_id: str = "", strict: bool = True) -> Optional[Plan]:
+    """Operands of the plan a verified rewrite instantiates (training labels for M2/M3).  With ``strict`` (the
+    default) the rewrite must also pass :func:`plan_adherence`; a rewrite that merely touches the site of a mechanism
+    without realising it is *unlabelled*, never attributed to that mechanism."""
     try:
         old_fn, new_fn = _fn_from_source(old_fn_src), _fn_from_source(new_fn_src)
     except (SyntaxError, ValueError):
@@ -570,12 +667,23 @@ def extract_plan(old_fn_src: str, new_fn_src: str, mechanism: str, function_id: 
         return None
     for s in sites:
         if site_in_change(s, info, changed):
+            if strict and not plan_adherence(mechanism, old_fn, new_fn, s):
+                continue
             ops = []
             if s.src:
                 ops.append(f"src={s.src}")
             if s.loop:
                 ops.append(f"loop={s.loop}")
             return Plan(function_id, mechanism, tuple(ops), tuple(MECHANISMS[mechanism].preserve))
+    return None
+
+
+def label_rewrite(old_fn_src: str, new_fn_src: str, function_id: str = "") -> Optional[Plan]:
+    """The plan a rewrite instantiates, over all mechanisms in priority order, or None (unlabelled rewrite)."""
+    for m in sorted(MECHANISMS.values(), key=lambda x: x.priority):
+        p = extract_plan(old_fn_src, new_fn_src, m.id, function_id)
+        if p is not None:
+            return p
     return None
 
 
@@ -618,8 +726,10 @@ PROBE_RECIPES: Dict[str, str] = {
     "p01": "empty_minimal", "p02": "single_element", "p03": "duplicates_and_order", "p04": "all_equal",
     "p05": "sorted_ascending", "p06": "sorted_descending", "p07": "mixed_sign", "p08": "missing_keys",
     "p09": "boundary_values", "p10": "large_magnitude", "p11": "whitespace_runs", "p12": "nested_empty",
-    "p13": "ties_for_extremes", "p14": "random_small",
+    "p13": "ties_for_extremes", "p14": "random_small", "p15": "aliased_inputs",
 }
+# p15 (aliasing where supported, 8.1): two arguments share one mutable object.  Contract v1 declares
+# ``aliasing: none`` for every task, so the recipe never reaches a menu until a contract version supports it.
 FIXED_EDGE_SUITE = ("p01", "p02", "p03")
 
 
@@ -859,6 +969,10 @@ def build_probe(contract: TaskContract, task_id: str, function: str, pid: str) -
     try:
         if pid == "p08":
             args = _build_missing(fc, types, rng)
+        elif pid == "p15":
+            if contract.aliasing == "none":
+                return None
+            args = _build_aliased(fc, types, rng)
         else:
             mode = _MODE[pid]
             everywhere = mode in ("empty", "boundary", "large", "mixed_sign", "small")
@@ -910,6 +1024,19 @@ def _build_missing(fc: FunctionContract, types: List[TypeExpr], rng: random.Rand
             args[lk] = type(args[lk])(b)
         return tuple(args)
     raise _Inapplicable()
+
+
+def _build_aliased(fc: FunctionContract, types: List[TypeExpr], rng: random.Random) -> Tuple:
+    """Two parameters of the same mutable container type bound to the *same* object."""
+    idx = [i for i, t in enumerate(types) if t.head in ("list", "set", "dict")]
+    gens = [_Gen(p, rng) for p in fc.params]
+    args: List[object] = [g.value(t, "small") for g, t in zip(gens, types)]
+    pairs = [(a, b) for a in idx for b in idx if a < b and str(types[a]) == str(types[b])]
+    if not pairs:
+        raise _Inapplicable()
+    a, b = pairs[0]
+    args[b] = args[a]
+    return tuple(args)
 
 
 @dataclass

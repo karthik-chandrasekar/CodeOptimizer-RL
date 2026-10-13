@@ -24,6 +24,8 @@ from tinyperf.model.transformer import TinyPerfLM, causal_padded_mask
 from tinyperf_chain.hashing import hash_json
 from tinyperf_chain.serve.cache import CacheKey, StaticKVCache, forward_static
 
+_engine_forward_static = forward_static     # the eager/compiled reference swap in serve.bench goes through here
+
 
 class EngineOverflow(ValueError):
     pass
@@ -46,12 +48,14 @@ class SamplingSpec:
 class GenResult:
     ids: List[int]
     logprobs: List[float]
-    finished: bool
+    finished: bool                 # ended on a stop token
     prompt_len: int
     prefill_ns: int = 0
     decode_ns: int = 0
     batch_size: int = 1
-    padded_tokens: int = 0
+    padded_tokens: int = 0         # prompt padding slots this row's batch carried (prefill waste)
+    timed_out: bool = False        # this row's own deadline passed before it finished (never another row's)
+    wasted_steps: int = 0          # decode steps this row's batch spent after this row had finished (14.3)
 
 
 def effective_logits(logits: torch.Tensor, spec: SamplingSpec) -> torch.Tensor:
@@ -89,7 +93,9 @@ class RoleEngine:
         self.tokenizer_sha256 = tokenizer_sha256
         self.name = name
         self.max_seq_len = model.cfg.max_seq_len
-        self.stats = {"calls": 0, "rows": 0, "prefill_ns": 0, "decode_ns": 0, "output_tokens": 0, "padded_tokens": 0}
+        self.cache_key = CacheKey(checkpoint_sha256, tokenizer_sha256, str(autocast_dtype))
+        self.stats = {"calls": 0, "rows": 0, "prefill_ns": 0, "decode_ns": 0, "output_tokens": 0, "padded_tokens": 0,
+                      "wasted_steps": 0, "timed_out_rows": 0, "peak_cache_bytes": 0}
 
     def _ac(self):
         if self.autocast_dtype is not None and str(self.device).startswith("cuda"):
@@ -98,9 +104,17 @@ class RoleEngine:
 
     @torch.no_grad()
     def generate(self, prompts: Sequence[Sequence[int]], max_new: int, spec: SamplingSpec, stop_ids: Sequence[int], *,
-                 pad_id: int = 0, seeds: Optional[Sequence[int]] = None, deadline: Optional[float] = None) -> List[GenResult]:
+                 pad_id: int = 0, seeds: Optional[Sequence[int]] = None, deadline: Optional[float] = None,
+                 deadlines: Optional[Sequence[Optional[float]]] = None) -> List[GenResult]:
+        """``deadline`` applies to every row; ``deadlines`` gives one per row.  A row whose own deadline passes is
+        marked ``timed_out`` and stops receiving tokens; the other rows of the batch continue - a request is never
+        cut short because it was co-batched with an expiring one (14.3)."""
         if not prompts:
             return []
+        if deadlines is not None and len(deadlines) != len(prompts):
+            raise ValueError("one deadline per prompt")
+        row_dl = [min(x for x in (d, deadline) if x is not None) if (d is not None or deadline is not None) else None
+                  for d in (deadlines if deadlines is not None else [None] * len(prompts))]
         for p in prompts:
             if len(p) == 0:
                 raise EngineOverflow("empty prompt")
@@ -119,21 +133,38 @@ class RoleEngine:
                 g.manual_seed(int(s) % (2 ** 63 - 1))
                 gens.append(g)
         stop = torch.tensor(list(stop_ids), device=dev)
+        sync = (lambda: torch.cuda.synchronize(dev)) if str(dev).startswith("cuda") else (lambda: None)
+        sync()
         t0 = time.perf_counter_ns()
         with self._ac():
             if self.static_cache:
-                cache = StaticKVCache(self.model, B, L + max_new, dev, key=CacheKey(self.checkpoint_sha256, self.tokenizer_sha256, str(self.autocast_dtype)))
-                logits = forward_static(self.model, ids, positions, cache, valid, last_only=True)[:, -1, :]
+                cache = StaticKVCache(self.model, B, L + max_new, dev, key=self.cache_key)
+                logits = _engine_forward_static(self.model, ids, positions, cache, valid, last_only=True, key=self.cache_key)[:, -1, :]
             else:
                 kv = self.model.new_cache()
                 logits = self.model(ids, attn_mask=causal_padded_mask(valid), positions=positions, cache=kv,
                                     last_logits_only=self.last_logits_only)[:, -1, :]
-        t1 = time.perf_counter_ns()
+        sync()
+        t1 = time.perf_counter_ns()          # device-synchronised prefill time (P0: prefill and decode separately)
         out_ids: List[List[int]] = [[] for _ in range(B)]
         out_lp: List[List[float]] = [[] for _ in range(B)]
         finished = torch.zeros(B, dtype=torch.bool, device=dev)
+        timed_out = [False] * B
+        wasted = [0] * B
         key_valid = valid
         for t in range(max_new):
+            if any(d is not None for d in row_dl):
+                now = time.monotonic()
+                for i, d in enumerate(row_dl):
+                    if d is not None and not timed_out[i] and now > d and not bool(finished[i]):
+                        timed_out[i] = True
+                        finished[i] = True
+            fl_before = finished.tolist()
+            for i in range(B):
+                if fl_before[i]:
+                    wasted[i] += 1              # a finished row still occupies this decode step
+            if all(fl_before):
+                break
             lg = effective_logits(logits, spec)
             if spec.greedy:
                 nxt = lg.argmax(-1)
@@ -146,35 +177,39 @@ class RoleEngine:
                     nxt = torch.stack([torch.multinomial(pc[i], 1, generator=gens[i]) for i in range(B)]).squeeze(-1).to(dev)
             lp = F.log_softmax(lg, -1).gather(-1, nxt[:, None]).squeeze(-1)
             is_stop = torch.isin(nxt, stop)
-            nl, ll, fl = nxt.tolist(), lp.tolist(), finished.tolist()
+            nl, ll = nxt.tolist(), lp.tolist()
             for i in range(B):
-                if not fl[i]:
+                if not fl_before[i]:
                     out_ids[i].append(nl[i])
                     out_lp[i].append(ll[i])
             finished = finished | is_stop
             if bool(finished.all()) or t == max_new - 1:
                 break
-            if deadline is not None and time.monotonic() > deadline:
-                break
             step_in = torch.where(finished, torch.full_like(nxt, pad_id), nxt)[:, None]
             pos = (prompt_len + t)[:, None]
             with self._ac():
                 if self.static_cache:
-                    logits = forward_static(self.model, step_in, pos, cache, torch.ones(B, 1, dtype=torch.bool, device=dev),
-                                            last_only=True)[:, -1, :]
+                    logits = _engine_forward_static(self.model, step_in, pos, cache, torch.ones(B, 1, dtype=torch.bool, device=dev),
+                                                    last_only=True, key=self.cache_key)[:, -1, :]
                 else:
                     key_valid = torch.cat([key_valid, torch.ones(B, 1, dtype=torch.bool, device=dev)], dim=1)
                     logits = self.model(step_in, attn_mask=key_valid[:, None, None, :], positions=pos, cache=kv)[:, -1, :]
+        sync()
         t2 = time.perf_counter_ns()
         fin = finished.tolist()
         padded = int(B * L - int(prompt_len.sum()))
-        res = [GenResult(out_ids[i], out_lp[i], bool(fin[i]), int(prompt_len[i]), t1 - t0, t2 - t1, B, padded) for i in range(B)]
+        res = [GenResult(out_ids[i], out_lp[i], bool(fin[i]) and not timed_out[i], int(prompt_len[i]), t1 - t0, t2 - t1, B,
+                         padded, timed_out[i], wasted[i]) for i in range(B)]
         self.stats["calls"] += 1
         self.stats["rows"] += B
         self.stats["prefill_ns"] += t1 - t0
         self.stats["decode_ns"] += t2 - t1
         self.stats["output_tokens"] += sum(len(r.ids) for r in res)
         self.stats["padded_tokens"] += padded
+        self.stats["wasted_steps"] += sum(wasted)
+        self.stats["timed_out_rows"] += sum(timed_out)
+        if self.static_cache:
+            self.stats["peak_cache_bytes"] = max(self.stats["peak_cache_bytes"], cache.memory_bytes())
         return res
 
 

@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 from tinyperf.env.protocol import EDIT_CLOSE, STOP_TOKEN, format_observation, parse_action
 from tinyperf_chain.adapters.base import Prepared, RoleAdapter
 from tinyperf_chain.config import RoleDecoding
-from tinyperf_chain.context import ContextOverflow, PromptBuilder
+from tinyperf_chain.context import ContextOverflow, M3View, M5View, PromptBuilder
 from tinyperf_chain.hashing import sha256_text
 from tinyperf_chain.schemas import (PATCH_ROLES, PatchAction, RequestEnvelope, RoleResponse, format_patch,
                                     parse_role_output)
@@ -36,12 +36,29 @@ def request_seed(request_id: str, salt: int = 0) -> int:
     return int(sha256_text(f"{salt}|{request_id}")[:15], 16)
 
 
+def view_for_prompt_role(prompt_role: str, role: str, view: Any) -> Any:
+    """Translate a role's public view into the view the prompt format of ``prompt_role`` expects.
+
+    ``M3`` answering the ``M5`` slot *without* the failure (9.3 ablation (a): regenerate from M3) sees the M3 view of
+    the same state: target, dependencies, contract and plan - the failed candidate and the feedback are dropped.
+    ``M5`` prompts built for M3 weights (ablation (b)) keep the M5 view.  Any other pairing is a bundle error."""
+    if prompt_role == role:
+        return view
+    if role == "M5" and prompt_role == "M3" and isinstance(view, M5View):
+        return M3View(view.function_id, view.current_source, list(view.dep_sources), view.contract, view.plan)
+    if role == "M3" and prompt_role == "M5" and isinstance(view, M3View):
+        return M5View(view.function_id, view.target_source, "", list(view.dep_sources), view.contract, view.plan,
+                      {"failure_kind": "none"})
+    raise ValueError(f"prompt_role {prompt_role} cannot serve role {role} with a {type(view).__name__}")
+
+
 class NeuralRoleAdapter(RoleAdapter):
     kind = "neural"
 
-    def __init__(self, engine: RoleEngine, tok, builder: PromptBuilder, decoding: RoleDecoding,
-                 prompt_role: Optional[str] = None, scheduler=None, engine_key: str = "", seed: int = 0):
-        self.engine = engine
+    def __init__(self, engine, tok, builder: PromptBuilder, decoding: RoleDecoding,
+                 prompt_role: Optional[str] = None, scheduler=None, engine_key: str = "", seed: int = 0,
+                 per_request_rng: bool = True):
+        self._engine = engine                 # a RoleEngine, or a zero-argument factory (non-resident role)
         self.tok = tok
         self.builder = builder
         self.decoding = decoding
@@ -49,15 +66,22 @@ class NeuralRoleAdapter(RoleAdapter):
         self.scheduler = scheduler
         self.engine_key = engine_key
         self.seed = seed
+        self.per_request_rng = per_request_rng
         self.stop_common = [tok.eos_id, tok.token_id(STOP_TOKEN)]
+
+    @property
+    def engine(self) -> RoleEngine:
+        if callable(self._engine) and not isinstance(self._engine, RoleEngine):
+            self._engine = self._engine()      # lazy load of a non-resident role (serving.resident_roles)
+        return self._engine
 
     def describe(self) -> Dict[str, Any]:
         return {"kind": self.kind, "checkpoint_sha256": self.engine.checkpoint_sha256, "prompt_role": self.prompt_role,
-                "decoding": self.decoding.__dict__}
+                "decoding": self.decoding.__dict__, "per_request_rng": self.per_request_rng}
 
     def prepare(self, role: str, view: Any, ctx: Dict[str, Any]) -> Prepared:
         pr = self.prompt_role or role
-        built = self.builder.build(pr, view)
+        built = self.builder.build(pr, view_for_prompt_role(pr, role, view))
         max_new = self.decoding.max_output
         if built.n_tokens + max_new > self.engine.max_seq_len:
             raise ContextOverflow(role, built.n_tokens + max_new, self.engine.max_seq_len)
@@ -77,21 +101,24 @@ class NeuralRoleAdapter(RoleAdapter):
                                               self.tok.pad_id, deadline)
             else:
                 out = self.engine.generate([prep.prompt_ids], prep.max_new_tokens, spec, stop, pad_id=self.tok.pad_id,
-                                           seeds=[seed], deadline=deadline)[0]
+                                           seeds=[seed] if self.per_request_rng else None, deadline=deadline)[0]
         except EngineOverflow as e:
             r = RoleResponse(prep.role, env.request_id, "", parse_role_output(prep.role, "", prep.ctx.get("function_id", "")),
                              self.kind, prep.prompt_tokens, 0, False, error="context_overflow")
             r.meta["detail"] = str(e)
             return r
+        t1 = time.perf_counter_ns()
         text = self.tok.decode(out.ids)
         parsed = parse_role_output(prep.role, text, prep.ctx.get("function_id", ""))
+        t2 = time.perf_counter_ns()
         r = RoleResponse(prep.role, env.request_id, text, parsed, self.kind, prep.prompt_tokens, len(out.ids), out.finished,
                          token_ids=list(out.ids), prompt_ids=list(prep.prompt_ids), logprobs=list(out.logprobs),
-                         latency_ns=time.perf_counter_ns() - t0,
+                         latency_ns=t2 - t0,
                          meta={"prefill_ns": out.prefill_ns, "decode_ns": out.decode_ns, "batch": out.batch_size,
-                               "sampling": spec.__dict__, "seed": seed})
-        if not out.finished and deadline is not None and time.monotonic() > deadline:
-            r.error = "timeout"
+                               "sampling": spec.__dict__, "seed": seed, "parse_ns": t2 - t1, "timed_out": out.timed_out,
+                               "wasted_steps": out.wasted_steps, "queue_wait_ns": getattr(out, "queue_wait_ns", 0)})
+        if out.timed_out:
+            r.error = "timeout"           # this request's own deadline, never a co-batched request's
         return r
 
 
@@ -119,8 +146,10 @@ class LegacyWriterAdapter(RoleAdapter):
 
     def execute(self, prep: Prepared, env: RequestEnvelope) -> RoleResponse:
         t0 = time.perf_counter_ns()
+        deadline = env.deadline_monotonic if env.deadline_monotonic != float("inf") else None
         out = self.engine.generate([prep.prompt_ids], self.max_new, self.spec, self.stop, pad_id=self.tok.pad_id,
-                                   seeds=[request_seed(env.request_id, self.seed)])[0]
+                                   seeds=[request_seed(env.request_id, self.seed)], deadline=deadline)[0]
+        t1 = time.perf_counter_ns()
         raw = self.tok.decode(out.ids)
         act = parse_action(raw)
         target = prep.ctx.get("function_name", "")
@@ -140,6 +169,12 @@ class LegacyWriterAdapter(RoleAdapter):
         else:
             text = raw
         parsed = parse_role_output(prep.role, text, prep.ctx.get("function_id", ""))
-        return RoleResponse(prep.role, env.request_id, text, parsed, self.kind, prep.prompt_tokens, len(out.ids),
-                            out.finished, token_ids=list(out.ids), prompt_ids=list(prep.prompt_ids),
-                            logprobs=list(out.logprobs), latency_ns=time.perf_counter_ns() - t0, meta=meta)
+        t2 = time.perf_counter_ns()
+        meta.update({"prefill_ns": out.prefill_ns, "decode_ns": out.decode_ns, "batch": out.batch_size, "parse_ns": t2 - t1,
+                     "timed_out": out.timed_out, "sampling": self.spec.__dict__, "seed": request_seed(env.request_id, self.seed)})
+        r = RoleResponse(prep.role, env.request_id, text, parsed, self.kind, prep.prompt_tokens, len(out.ids),
+                         out.finished, token_ids=list(out.ids), prompt_ids=list(prep.prompt_ids),
+                         logprobs=list(out.logprobs), latency_ns=t2 - t0, meta=meta)
+        if out.timed_out:
+            r.error = "timeout"
+        return r

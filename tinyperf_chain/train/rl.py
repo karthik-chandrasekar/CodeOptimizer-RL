@@ -41,7 +41,7 @@ from tinyperf_chain.context import M3View, M5View, PromptBuilder
 from tinyperf_chain.data.collect import Collector
 from tinyperf_chain.hashing import hash_json, sha256_file, sha256_text
 from tinyperf_chain.ledger import AppendLedger, ObjectStore
-from tinyperf_chain.program import Program, dependency_closure
+from tinyperf_chain.program import Program, dependency_closure, dependency_sources
 from tinyperf_chain.schemas import format_plan, parse_patch, parse_plan
 from tinyperf_chain.serve.engine import RoleEngine, SamplingSpec, effective_logprobs
 from tinyperf_chain.tasks import PrivateSuite, PublicTask
@@ -57,19 +57,31 @@ class CondState:
     prompt_ids: List[int]
     failed: str = ""
     key: str = ""
+    plan_source: str = "reference"     # reference | rule | bundle:<hash> (7.3 stratification)
+    mechanism: str = ""
+    source_lines: int = 0
+    failure_kind: str = ""
 
 
 def rewards_for(outcome: Optional[Dict[str, Any]], parsed_ok: bool, abandon: bool, cfg: ChainConfig) -> Tuple[float, bool, float]:
-    """(R, invalid, g) for one response under eqs. (4)-(5)."""
+    """(R, invalid, g) for one response under eqs. (4)-(5).  'Invalid' is malformed, out-of-scope or a semantic
+    failure of the registered taxonomy; a proposal that reproduces the current program (a reversion) is a safe
+    abandonment and pays only the slot cost (9.2)."""
     rl = cfg.rl
     if not parsed_ok:
         return -rl.slot_cost - rl.invalid_penalty, True, 0.0
     if abandon:
         return -rl.slot_cost, False, 0.0
     assert outcome is not None
-    invalid = outcome["stage"] in ("scope", "smoke", "probe", "mandatory") or outcome.get("kind") == "duplicate"
+    if outcome.get("kind") == "duplicate":
+        return -rl.slot_cost, False, 0.0
+    invalid = outcome["stage"] in ("scope", "smoke", "probe", "mandatory")
     g = min(math.log(outcome["speedup"]), rl.gain_cap) if outcome.get("accepted") else 0.0
     return g - rl.slot_cost - (rl.invalid_penalty if invalid else 0.0), invalid, g
+
+
+def _bucket_len(n: int) -> str:
+    return "short" if n <= 8 else ("medium" if n <= 20 else "long")
 
 
 def group_advantages(rewards: Sequence[float]) -> List[float]:
@@ -150,6 +162,8 @@ class RoleRL:
         if not self.states:
             raise RuntimeError(f"no training conditioning states for {role}")
         self.step = 0
+        self.states_sha256 = hash_json(sorted(cs.key for cs in self.states))
+        self._resume()
 
     # -------------------------------------------------------------- #
     def _load_states(self) -> List[CondState]:
@@ -157,10 +171,10 @@ class RoleRL:
         seen = set()
         trials = list(self.collector.ledger.read())
         for r in trials:
-            if r.get("split") != "train" or r["task_id"] not in self.tasks:
+            if r.get("split") != "train" or r["task_id"] not in self.tasks or not r.get("plan"):
                 continue
             task, _ = self.tasks[r["task_id"]]
-            if self.role == "M3" and r["kind"] in ("plan_patch", "chain_plan_state") and r.get("plan"):
+            if self.role == "M3" and r["kind"] in ("plan_patch", "chain_plan_state"):
                 key = (r["task_id"], r["state_sha256"], r["function"], r["plan"])
             elif self.role == "M5" and r["kind"] == "repair" and (r["feedback_visibility"] != "category_only"
                                                                   or "private_mismatch" in self.cfg.verification.repairable_failures):
@@ -176,7 +190,7 @@ class RoleRL:
             if not pr.ok or pr.payload.is_no_plan:
                 continue
             fn = state.function_node(name)
-            deps = [state.function_source(f) for f in dependency_closure(state, name).functions]
+            deps = dependency_sources(state, dependency_closure(state, name))
             fid = f"f{self.rng.randrange(len(task.functions)):02d}"
             if self.role == "M3":
                 view = M3View(fid, state.function_source(name), deps, task.contract.render(name), format_plan(pr.payload),
@@ -190,8 +204,46 @@ class RoleRL:
                 built = self.builder.build(self.role, view)
             except Exception:  # noqa: BLE001 - context overflow: not a usable conditioning state
                 continue
-            out.append(CondState(self.role, r["task_id"], state, name, r["plan"], built.ids, failed, hash_json(list(key))))
+            if r["kind"] == "chain_plan_state":
+                src = f"bundle:{str(r.get('bundle', ''))[:16]}"
+            elif r.get("proposer") == "programmatic" or r["kind"] == "repair":
+                src = "rule"
+            else:
+                src = r.get("proposer") or "reference"
+            out.append(CondState(self.role, r["task_id"], state, name, r["plan"], built.ids, failed, hash_json(list(key)),
+                                 plan_source=src, mechanism=pr.payload.transform_id,
+                                 source_lines=len(state.function_source(name).splitlines()),
+                                 failure_kind=str(r.get("failure_kind") or "")))
         return out
+
+    # -------------------------------------------------------------- #
+    def _train_state(self) -> Dict[str, Any]:
+        st = {"step": self.step, "optimizer": self.opt.state_dict(), "rng_python": self.rng.getstate(),
+              "rng_torch": torch.get_rng_state(), "states_sha256": self.states_sha256, "parent_sha256": self.init_sha,
+              "role": self.role, "rl": self.cfg.rl.__dict__}
+        if torch.cuda.is_available():
+            st["rng_cuda"] = torch.cuda.get_rng_state_all()
+        return st
+
+    def _resume(self) -> None:
+        """T25: resume restores the same policy, optimizer, RNG and conditioning-state set, or refuses."""
+        last = os.path.join(self.out, "last.pt")
+        if not os.path.exists(last):
+            return
+        ck = torch.load(last, map_location="cpu", weights_only=False)
+        st = ck["extra"].get("train_state")
+        if not st:
+            return
+        if st.get("states_sha256") != self.states_sha256 or st.get("parent_sha256") != self.init_sha:
+            raise RuntimeError("cannot resume RL: the conditioning states or the parent checkpoint changed; start a separately "
+                               "identified run")
+        self.model.load_state_dict(ck["state_dict"])
+        self.opt.load_state_dict(st["optimizer"])
+        self.step = int(st["step"])
+        self.rng.setstate(tuple(st["rng_python"]) if isinstance(st["rng_python"], list) else st["rng_python"])
+        torch.set_rng_state(st["rng_torch"])
+        if st.get("rng_cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(st["rng_cuda"])
 
     def log(self, **m: Any) -> None:
         with open(self.metrics_path, "a") as f:
@@ -214,6 +266,8 @@ class RoleRL:
         stop = [self.tok.eos_id, self.tok.token_id(STOP_TOKEN), self.tok.token_id(EDIT_CLOSE)]
         prompts, responses, beh_lp, advs, rows = [], [], [], [], []
         n_zero, n_invalid, n_accept, rewards_all = 0, 0, 0, []
+        fail_kinds: Dict[str, int] = {}
+        strata: Dict[str, Dict[str, float]] = {}
         t0 = time.time()
         for si, cs in enumerate(states):
             seeds = [self.rng.randrange(1 << 40) for _ in range(G)]
@@ -232,9 +286,24 @@ class RoleRL:
                 R_.append(r)
                 n_invalid += int(invalid)
                 n_accept += int(bool(outcome and outcome.get("accepted")))
+                # 7.3: syntax / scope / online-correctness separately, stratified by length, mechanism, plan source
+                fk = "malformed" if not pr.ok else ("abandon" if pr.payload.is_abandon else
+                                                    ("syntax" if outcome and outcome["stage"] == "scope" and outcome["kind"] == "syntax_error" else
+                                                     ("scope" if outcome and outcome["stage"] == "scope" else
+                                                      ("correctness" if outcome and outcome["stage"] in ("smoke", "probe", "mandatory") else
+                                                       ("accepted" if outcome and outcome.get("accepted") else "correct_not_faster")))))
+                fail_kinds[fk] = fail_kinds.get(fk, 0) + 1
+                for sk in (f"len:{_bucket_len(cs.source_lines)}", f"mech:{cs.mechanism}", f"plan_src:{cs.plan_source}"):
+                    d = strata.setdefault(sk, {"n": 0, "accepted": 0, "invalid": 0, "reward": 0.0})
+                    d["n"] += 1
+                    d["accepted"] += int(bool(outcome and outcome.get("accepted")))
+                    d["invalid"] += int(invalid)
+                    d["reward"] += r
                 rows.append({"update": self.step, "state": cs.key, "policy": pol, "sampling": self.spec.__dict__,
                              "seed": seeds[gi], "token_ids": g.ids, "behaviour_logprobs": g.logprobs, "finished": g.finished,
-                             "reward": r, "gain": gain, "invalid": invalid, "outcome": outcome and {k: outcome.get(k) for k in ("stage", "kind", "accepted", "speedup")}})
+                             "reward": r, "gain": gain, "invalid": invalid, "failure_kind": fk, "plan_source": cs.plan_source,
+                             "mechanism": cs.mechanism, "source_lines": cs.source_lines, "task_id": cs.task_id,
+                             "outcome": outcome and {k: outcome.get(k) for k in ("stage", "kind", "accepted", "speedup")}})
             A = group_advantages(R_)
             if max(abs(a) for a in A) < 1e-12:
                 n_zero += 1
@@ -276,26 +345,36 @@ class RoleRL:
         self.opt.step()
         self.step += 1
         mean_r = sum(rewards_all) / len(rewards_all)
+        n = len(rewards_all)
         m = {"loss": loss_total, "reward_mean": mean_r,
-             "reward_var": sum((r - mean_r) ** 2 for r in rewards_all) / len(rewards_all),
-             "zero_advantage_groups": n_zero, "invalid_rate": n_invalid / len(rewards_all),
-             "accept_rate": n_accept / len(rewards_all), "clip_frac": stats["clip_frac"] / max(1, stats["tokens"]),
+             "reward_var": sum((r - mean_r) ** 2 for r in rewards_all) / n,
+             "zero_advantage_groups": n_zero, "invalid_rate": n_invalid / n,
+             "accept_rate": n_accept / n, "clip_frac": stats["clip_frac"] / max(1, stats["tokens"]),
              "response_len": sum(len(r) for r in responses) / len(responses), "grad_norm": float(gn),
-             "max_logprob_diff": max_diff, "t_rollout": t_roll}
+             "max_logprob_diff": max_diff, "t_rollout": t_roll,
+             "rates": {k: v / n for k, v in sorted(fail_kinds.items())},
+             "strata": {k: {"n": d["n"], "accept_rate": d["accepted"] / d["n"], "invalid_rate": d["invalid"] / d["n"],
+                            "reward_mean": d["reward"] / d["n"]} for k, d in sorted(strata.items())}}
         self.log(**m)
         return m
 
     def train(self) -> str:
-        for _ in range(self.cfg.rl.max_updates):
+        while self.step < self.cfg.rl.max_updates:
             self.update()
             if self.cfg.rl.save_every and self.step % self.cfg.rl.save_every == 0:
                 self.save(f"step{self.step:04d}.pt")
+            self.save("last.pt", with_state=True)
         return self.save("final.pt")
 
-    def save(self, name: str) -> str:
+    def save(self, name: str, with_state: bool = False) -> str:
         path = os.path.join(self.out, name)
-        self.model.save(path, extra={"role": self.role, "stage": "rl", "parent_sha256": self.init_sha, "step": self.step,
-                                     "tokenizer_path": self.cfg.model.tokenizer, "rl": self.cfg.rl.__dict__})
+        extra = {"role": self.role, "stage": "rl", "parent_sha256": self.init_sha, "step": self.step,
+                 "tokenizer_path": self.cfg.model.tokenizer, "rl": self.cfg.rl.__dict__, "states_sha256": self.states_sha256}
+        if with_state:
+            extra["train_state"] = self._train_state()
+        tmp = path + ".tmp"
+        self.model.save(tmp, extra=extra)
+        os.replace(tmp, path)
         return path
 
 

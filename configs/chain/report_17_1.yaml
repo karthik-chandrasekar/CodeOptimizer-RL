@@ -1,0 +1,57 @@
+# The strict configuration of report section 17.1, verbatim (plus nothing).  Loads with M3/M5 sampling at 0.6 and
+# the other roles greedy; search_wall_seconds stays null until calibrated (eval:confirmation refuses to run without it).
+experiment:
+  name: tinyperf_chain_v1
+  seed: 17
+  bundle_frozen_per_episode: true
+  final_test_access: evaluator_only
+model:
+  seed_checkpoint: ${TINYPERF_CKPT}
+  tokenizer: ${TINYPERF_TOKENIZER}
+  context_tokens: 2048
+  add_special_tokens: false
+  full_model_finetuning: true
+roles:
+  M1: {max_input: 2016, max_output: 32, mode: greedy}
+  M2: {max_input: 1888, max_output: 160, mode: greedy}
+  M3: {max_input: 1408, max_output: 640, temperature: 0.6}
+  M4: {max_input: 1952, max_output: 96, mode: greedy}
+  M5: {max_input: 1408, max_output: 640, temperature: 0.6}
+budget:
+  patch_slots: 6
+  role_calls: 32
+  total_input_output_tokens: 20000
+  extra_probe_calls: 18
+  max_repairs_per_lineage: 1
+  max_plans_per_function_version: 2
+  max_profiles: 7
+  search_wall_seconds: null
+verification:
+  semantic_reference: immutable_original
+  online_private_feedback: category_only
+  final_audit_feedback: disabled
+  accept_incremental_speedup: 1.03
+  accept_rule: paired_log_median_ci_lower
+  timing_bootstrap_draws: 1000
+  timing_interval: 0.95
+  success_final_speedup: 1.50
+  train_timing_blocks: 5
+  development_timing_blocks: 15
+  audit_timing_blocks: 31
+  uncertain_timing_policy: reject
+training:
+  stage: sft
+  lr: 0.00002
+  epochs: 3
+  microbatch: 4
+  accumulate: 8
+  loss: response_mean_per_example
+  gradient_clip: 1.0
+  checkpoint_selection: development_only
+serving:
+  resident_roles: [M1, M2, M3, M4, M5]
+  eager_reference_enabled: true
+  compile_enabled: false
+  correctness_workers: 2
+  timing_workers: 1
+  max_pending_candidates: 16

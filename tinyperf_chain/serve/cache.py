@@ -78,12 +78,19 @@ def chunk_mask(valid: torch.Tensor, start: int, T: int) -> torch.Tensor:
     return m | diag
 
 
+class CacheIdentityError(RuntimeError):
+    """The cache was filled by a different model version / tokenizer / numerical mode than the one using it (14.2)."""
+
+
 @torch.no_grad()
 def forward_static(model: TinyPerfLM, idx: torch.Tensor, positions: torch.Tensor, cache: StaticKVCache,
-                   new_valid: torch.Tensor, last_only: bool = True) -> torch.Tensor:
+                   new_valid: torch.Tensor, last_only: bool = True, key: Optional[CacheKey] = None) -> torch.Tensor:
     """Run ``idx`` ([B, T], absolute RoPE ``positions`` [B, T]) at cache slots ``[cache.length, cache.length + T)``.
 
-    ``new_valid`` [B, T] marks which of the new slots hold real tokens.  Returns logits [B, 1|T, V]."""
+    ``new_valid`` [B, T] marks which of the new slots hold real tokens.  Returns logits [B, 1|T, V].  When ``key``
+    is given it must equal the cache's recorded identity: a cache never survives a model-version change."""
+    if key is not None and cache.key is not None and key != cache.key:
+        raise CacheIdentityError(f"cache identity {cache.key} != {key}")
     B, T = idx.shape
     start = cache.length
     if start + T > cache.capacity:

@@ -25,6 +25,7 @@ Builders only accept *public views* (no private suites, seeds, references or pri
 """
 from __future__ import annotations
 
+import ast
 import difflib
 import math
 from dataclasses import dataclass, field
@@ -68,6 +69,7 @@ class M1View:
     catalog: List[CatalogEntry]
     history: List[str] = field(default_factory=list)       # "f01:membership_index:probe_mismatch"
     remaining_patches: int = 0
+    rename: Dict[str, str] = field(default_factory=dict)   # real function name -> display id (5.1: consistent renaming)
 
 
 @dataclass
@@ -138,6 +140,42 @@ def calls_bucket(n: int) -> int:
     return int(min(15, math.floor(math.log2(max(0, int(n)) + 1))))
 
 
+class _Renamer(ast.NodeTransformer):
+    def __init__(self, mapping: Dict[str, str]):
+        self.mapping = mapping
+        self._shadowed: List[set] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        from tinyperf_chain.program import locally_bound
+
+        node.name = self.mapping.get(node.name, node.name)
+        # a parameter or local that shares a task function's name shadows it: leave that name alone inside here
+        self._shadowed.append(set(locally_bound(node)) & set(self.mapping))
+        try:
+            return self.generic_visit(node)
+        finally:
+            self._shadowed.pop()
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id in self.mapping and not any(node.id in sh for sh in self._shadowed):
+            return ast.copy_location(ast.Name(id=self.mapping[node.id], ctx=node.ctx), node)
+        return node
+
+
+def rename_functions(src: str, mapping: Dict[str, str]) -> str:
+    """Rename the task's function identifiers consistently inside ``src`` (definitions and call sites), so M1 sees
+    ``def f02(...)`` and ``f01(...)`` rather than the real names.  Breaks naming shortcuts without changing structure."""
+    if not mapping:
+        return src
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return src
+    tree = _Renamer(mapping).visit(tree)
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
+
+
 def compact_diff(a: str, b: str, max_lines: int = 40) -> str:
     lines = list(difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=0))[2:]
     lines = [l for l in lines if not l.startswith("@@")]
@@ -204,13 +242,27 @@ class PromptBuilder:
         text, ids, dropped = self._fit(role, sections)
         return BuiltPrompt(role, text, ids, dropped)
 
+    @staticmethod
+    def _history_sections(history: List[str], recent: int) -> List[_Section]:
+        """The attempt ledger is never pre-truncated: the most recent entries form one optional section, the older
+        ones another that the preflight drops first (4.3: 'remove optional history first')."""
+        rec, old = history[-recent:], history[:-recent] if len(history) > recent else []
+        secs = []
+        if old:
+            secs.append(_Section("history_older", "".join(f"tried={state_value(h)}\n" for h in old), False, 12))
+        if rec:
+            secs.append(_Section("history", "".join(f"tried={state_value(h)}\n" for h in rec), False, 10))
+        return secs
+
     def _m1(self, v: M1View) -> BuiltPrompt:
-        full = "".join(f"# {e.display_id}\n{e.source.rstrip()}\n\n" for e in v.catalog)
+        shown = [(e, rename_functions(e.source, v.rename) if v.rename else e.source) for e in v.catalog]
+        full = "".join(f"# {e.display_id}\n{src.rstrip()}\n\n" for e, src in shown)
         try:
             text, ids, dropped = self._fit("M1", self._sections_m1(v, full))
             return BuiltPrompt("M1", text, ids, dropped)
         except ContextOverflow:
-            summary = "".join(f"# {e.display_id}\n{e.summary.rstrip()}\n\n" for e in v.catalog)
+            summary = "".join(f"# {e.display_id}\n{rename_functions(e.summary, v.rename).rstrip() if v.rename else e.summary.rstrip()}\n\n"
+                              for e in v.catalog)
             text, ids, dropped = self._fit("M1", self._sections_m1(v, summary))
             return BuiltPrompt("M1", text, ids, dropped + ["sources->summaries"], compact=True)
 
@@ -222,8 +274,7 @@ class PromptBuilder:
             _Section("catalog_ids", self._kv("catalog", ",".join(e.display_id for e in v.catalog)), True),
             _Section("profile", cat, True),
             _Section("remaining", self._kv("remaining_patches", v.remaining_patches), True),
-            _Section("history", "".join(self._kv("tried", h) for h in v.history[-12:]), False, 10),
-        ]
+        ] + self._history_sections(v.history, 12)
 
     def _sections_m2(self, v: M2View) -> List[_Section]:
         secs = [_Section("code_target", self._code(v.target_source), True)]
@@ -235,8 +286,7 @@ class PromptBuilder:
             _Section("anchors", self._kv("anchors", v.anchors), True),
             _Section("names", self._kv("names", ",".join(v.names)), False, 2),
             _Section("menu", self._kv("menu", ",".join(v.menu) or "none"), True),
-            _Section("history", "".join(self._kv("tried", h) for h in v.history[-8:]), False, 10),
-        ]
+        ] + self._history_sections(v.history, 8)
         return secs
 
     def _sections_m3(self, v: M3View) -> List[_Section]:

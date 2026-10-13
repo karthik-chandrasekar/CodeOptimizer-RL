@@ -109,6 +109,60 @@ def referenced_files(b: Dict[str, Any]) -> Dict[str, str]:
     return files
 
 
+def checkpoint_manifest(path: str) -> Dict[str, Any]:
+    """Architecture counts (eq. 1 and a recount), parent hash and training-data hashes of one checkpoint, read from
+    the serialized metadata of a trusted file (16.4).  Weights are referenced by hash, never embedded."""
+    import torch
+
+    from tinyperf_chain.train.branch import param_formula
+
+    from tinyperf.model.transformer import TinyPerfLM
+
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    cfg = ck.get("model_cfg", ck.get("config", {})) if isinstance(ck, dict) else {}
+    extra = ck.get("extra", {}) if isinstance(ck, dict) else {}
+    try:
+        n_recount = int(TinyPerfLM.load(path, map_location="cpu").n_params())   # the same recount as branch time
+    except Exception:  # noqa: BLE001 - a foreign checkpoint: recount unavailable
+        n_recount = None
+    arch = {k: cfg.get(k) for k in ("vocab_size", "n_embd", "n_layer", "n_head", "mlp_dim", "max_seq_len", "tie_embeddings") if k in cfg}
+    formula = None
+    if all(k in arch for k in ("vocab_size", "n_embd", "n_layer", "mlp_dim")):
+        formula = param_formula(arch["vocab_size"], arch["n_embd"], arch["n_layer"], arch["mlp_dim"])
+    return {"sha256": sha256_file(path), "architecture": arch, "params_formula": formula, "params_recount": n_recount,
+            "parent_sha256": extra.get("parent_sha256"), "role": extra.get("role"), "stage": extra.get("stage"),
+            "training_data_sha256": extra.get("data_hash"), "tokenizer_sha256": extra.get("tokenizer_sha256"),
+            "train_step": extra.get("step")}
+
+
+def release_manifest(b: Dict[str, Any], cfg: ChainConfig) -> Dict[str, Any]:
+    """Everything 17.4 asks a released bundle to carry, derived from the bundle and the evaluation config."""
+    from tinyperf_chain.contracts import CONTRACT_VERSION, TaskContract
+
+    weights: Dict[str, Any] = {}
+    for r in ROLE_ORDER:
+        spec = b["roles"][r]
+        if spec.get("checkpoint"):
+            weights[r] = {"path": spec["checkpoint"], **checkpoint_manifest(spec["checkpoint"])}
+    decoding = {}
+    for r in ROLE_ORDER:
+        spec = b["roles"][r]
+        d = replace(cfg.roles.get(r), **spec.get("decoding", {}))
+        decoding[r] = {"adapter": spec.get("adapter"), "rule": spec.get("rule"), "prompt_role": spec.get("prompt_role"),
+                       **{k: getattr(d, k) for k in ("max_input", "max_output", "mode", "temperature", "top_k", "top_p")}}
+    return {
+        "weights": weights,
+        "tokenizer_sha256": sha256_file(b["tokenizer"]) if b.get("tokenizer") and os.path.exists(b["tokenizer"]) else None,
+        "role_schemas": dict(SCHEMA_VERSIONS, parser=PARSER_VERSION),
+        "decoding": decoding,
+        "registries": {"transforms": registry_hash(), "probes": probe_registry_hash(),
+                       "contracts": hash_json([CONTRACT_VERSION, TaskContract.SUPPORTED_POLICIES])},
+        "evaluator": {"verification": cfg.verification.__dict__, "budget": cfg.budget.__dict__, "sandbox": {
+            k: v for k, v in cfg.sandbox.__dict__.items() if k != "allowed_modules"}},
+        "context_tokens": cfg.model.context_tokens,
+    }
+
+
 def lock_bundle(path: str, out: str, cfg: ChainConfig) -> Dict[str, Any]:
     from tinyperf_chain.config import config_hash
 
@@ -119,6 +173,7 @@ def lock_bundle(path: str, out: str, cfg: ChainConfig) -> Dict[str, Any]:
     b["registries"] = {"transforms": registry_hash(), "probes": probe_registry_hash()}
     b["schemas"] = dict(SCHEMA_VERSIONS, parser=PARSER_VERSION)
     b["config_sha256"] = config_hash(cfg)
+    b["release"] = release_manifest(b, cfg)
     b["environment"] = environment_manifest()
     b["bundle_sha256"] = hash_json({k: v for k, v in b.items() if k not in ("bundle_sha256", "environment")})
     with open(out, "w") as f:
@@ -198,23 +253,30 @@ def build_router(b: Dict[str, Any], cfg: ChainConfig, *, device: str = "cpu", us
         builder = PromptBuilder(tok, cfg.roles, cfg.model.context_tokens)
     ac = torch.bfloat16 if (str(device).startswith("cuda") and cfg.training.precision == "bf16_autocast") else None
     engines: Dict[str, RoleEngine] = {}
+
+    def _make_engine(ck: str) -> RoleEngine:
+        h = sha256_file(ck)
+        m = TinyPerfLM.load(ck, map_location="cpu")
+        if tok is not None and tok.vocab_size > m.cfg.vocab_size:
+            raise BundleError(f"{ck}: tokenizer larger than model vocabulary")
+        return RoleEngine(m, device=device, static_cache=cfg.serving.static_kv_cache,
+                          last_logits_only=cfg.serving.last_logits_only, autocast_dtype=ac,
+                          checkpoint_sha256=h, tokenizer_sha256=tok_hash, name=os.path.basename(ck))
+
+    resident = set(cfg.serving.resident_roles)
     for r in ROLE_ORDER:
         spec = b["roles"][r]
         if spec.get("adapter") in ("neural", "legacy_writer"):
             ck = spec["checkpoint"]
-            if ck not in engines:
-                h = sha256_file(ck)
-                m = TinyPerfLM.load(ck, map_location="cpu")
-                if tok is not None and tok.vocab_size > m.cfg.vocab_size:
-                    raise BundleError(f"{ck}: tokenizer larger than model vocabulary")
-                engines[ck] = RoleEngine(m, device=device, static_cache=cfg.serving.static_kv_cache,
-                                         last_logits_only=cfg.serving.last_logits_only, autocast_dtype=ac,
-                                         checkpoint_sha256=h, tokenizer_sha256=tok_hash, name=os.path.basename(ck))
+            # resident roles are loaded once, up front (P1); a non-resident role loads on its first call and is
+            # then kept (never a per-request reload); the scheduler only batches resident engines
+            if ck not in engines and (r in resident or spec.get("adapter") == "legacy_writer" or not use_scheduler):
+                engines[ck] = _make_engine(ck)
     sched = None
     if use_scheduler and engines:
         sched = RoleScheduler(engines, window_ms=cfg.serving.batch_window_ms, max_batch=cfg.serving.max_batch,
                               max_pending=max(16, cfg.serving.max_pending_candidates * 4),
-                              length_buckets=cfg.serving.length_buckets)
+                              length_buckets=cfg.serving.length_buckets, mode=cfg.serving.scheduler_mode)
     adapters: Dict[str, RoleAdapter] = {}
     for r in ROLE_ORDER:
         spec = b["roles"][r]
@@ -223,8 +285,13 @@ def build_router(b: Dict[str, Any], cfg: ChainConfig, *, device: str = "cpu", us
             adapters[r] = _rule_adapter(r, spec.get("rule", ""), seed)
         elif kind == "neural":
             dec = replace(cfg.roles.get(r), **spec.get("decoding", {}))
-            adapters[r] = NeuralRoleAdapter(engines[spec["checkpoint"]], tok, builder, dec, spec.get("prompt_role"),
-                                            sched, spec["checkpoint"], seed)
+            ck = spec["checkpoint"]
+            if ck in engines:
+                adapters[r] = NeuralRoleAdapter(engines[ck], tok, builder, dec, spec.get("prompt_role"), sched, ck, seed,
+                                                per_request_rng=cfg.serving.per_request_rng)
+            else:   # non-resident: lazy, unbatched
+                adapters[r] = NeuralRoleAdapter((lambda c=ck: engines.setdefault(c, _make_engine(c))), tok, builder, dec,
+                                                spec.get("prompt_role"), None, ck, seed, per_request_rng=cfg.serving.per_request_rng)
         elif kind == "legacy_writer":
             if r != "M3":
                 raise BundleError("legacy_writer can only serve M3")

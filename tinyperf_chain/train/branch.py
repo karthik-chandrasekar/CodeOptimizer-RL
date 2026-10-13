@@ -31,6 +31,26 @@ def param_count_formula(V: int, d: int, L: int, m: int) -> int:
     return V * d + L * (4 * d * d + 3 * d * m + 2 * d) + d
 
 
+param_formula = param_count_formula
+
+
+def dense_control_report(student: "tuple[int, int, int, int]", dense_config: str = "configs/model/dense10m.yaml") -> Dict[str, Any]:
+    """Eq. 1 accounting for the bank of five students vs the dense control *read from its config file* (2.2)."""
+    import yaml
+
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = dense_config if os.path.isabs(dense_config) else os.path.join(repo, dense_config)
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    mc = raw.get("model", raw)
+    dense = (int(mc["vocab_size"]), int(mc["n_embd"]), int(mc["n_layer"]), int(mc["mlp_dim"]))
+    one = param_count_formula(*student)
+    d = param_count_formula(*dense)
+    return {"config": dense_config, "dense_vocab_n_embd_n_layer_mlp": list(dense), "formula_params": d,
+            "one_student_params": one, "five_role_bank_params": 5 * one, "bank_minus_dense": 5 * one - d,
+            "bf16_mb": {"one_student": one * 2 / 1e6, "bank": 5 * one * 2 / 1e6, "dense": d * 2 / 1e6}}
+
+
 def kv_bytes(L: int, d: int, T: int, bytes_per: int = 2) -> int:
     return 2 * L * d * T * bytes_per
 
@@ -116,9 +136,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         raise SystemExit("no seed checkpoint (set TINYPERF_CKPT or model.seed_checkpoint)")
     m = branch(seed, a.out or cfg.paths.sub("checkpoints", "initial"), cfg, a.tokenizer or cfg.model.tokenizer or None)
     if a.dense_report:
-        m["dense_control"] = {"config": "configs/model/dense10m.yaml",
-                              "formula_params": param_count_formula(8192, 256, 8, 1024),
-                              "bank_minus_dense": 5 * param_count_formula(8192, 128, 4, 512) - param_count_formula(8192, 256, 8, 1024)}
+        mm = cfg.model
+        m["dense_control"] = dense_control_report((mm.expect_vocab_size, mm.expect_n_embd, mm.expect_n_layer, mm.expect_mlp_dim))
     print(json.dumps(m, indent=1))
 
 

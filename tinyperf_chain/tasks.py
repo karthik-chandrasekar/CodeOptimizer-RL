@@ -76,6 +76,17 @@ class PublicTask:
         )
 
 
+@dataclass(frozen=True)
+class OnlineSuite:
+    """The *online* private checks only: what the search-time verifier may run (13.3).  Audit constructors, audit
+    seeds and privileged provenance are not reachable from this object, so the controller cannot touch them even by
+    mistake; only :meth:`PrivateSuite.online` produces it and only the final audit receives the full suite."""
+
+    task_id: str
+    online_correctness: Tuple[Call, ...]
+    online_timing: Tuple[Call, ...]
+
+
 @dataclass
 class PrivateSuite:
     task_id: str
@@ -85,6 +96,9 @@ class PrivateSuite:
     audit_timing: List[Call]
     seeds: Dict[str, int] = field(default_factory=dict)
     privileged: Dict[str, Any] = field(default_factory=dict)   # fast_source, slow_functions, families, ...
+
+    def online(self) -> OnlineSuite:
+        return OnlineSuite(self.task_id, tuple(self.online_correctness), tuple(self.online_timing))
 
     def to_row(self) -> Dict[str, Any]:
         return {"task_id": self.task_id, "online_correctness": _enc_calls(self.online_correctness),

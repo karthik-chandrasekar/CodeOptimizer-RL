@@ -30,11 +30,36 @@ from tinyperf_chain.program import Program
 from tinyperf_chain.sandbox import codec
 from tinyperf_chain.sandbox.runner import SandboxRunner
 from tinyperf_chain.sandbox.timing import TimingVerdict, median, timing_verdict
-from tinyperf_chain.tasks import Call, PrivateSuite, PublicTask
+from tinyperf_chain.tasks import Call, OnlineSuite, PrivateSuite, PublicTask
 
 
 class InfrastructureError(RuntimeError):
     """The harness (not the candidate) failed: worker could not launch, reference program failed, ..."""
+
+
+class MalformedRecord(InfrastructureError):
+    """The trusted worker returned a record the parent cannot interpret (a harness bug, never a candidate label)."""
+
+
+_RECORD_KEYS = {"exc", "enc", "digest", "unencodable", "elapsed_ns"}
+
+
+def validate_record(g: Any, output: str = "full") -> Dict[str, Any]:
+    """Structure check before any field of a worker record is used (13.1: validate before deserialisation)."""
+    if not isinstance(g, dict) or not set(g) <= _RECORD_KEYS or "exc" not in g:
+        raise MalformedRecord(f"record shape {type(g).__name__}:{sorted(g) if isinstance(g, dict) else ''}")
+    if g.get("exc") is not None and not isinstance(g["exc"], str):
+        raise MalformedRecord("exception field is not a string")
+    if "unencodable" in g:
+        return g
+    if output == "digest":
+        if not isinstance(g.get("digest"), str):
+            raise MalformedRecord("digest record without a digest")
+        return g
+    enc = g.get("enc")
+    if not (isinstance(enc, list) and len(enc) == 2 and enc[0] == "T" and isinstance(enc[1], list) and len(enc[1]) == 2):
+        raise MalformedRecord("record encoding is not a (args, return) pair")
+    return g
 
 
 @dataclass
@@ -77,6 +102,11 @@ class TimingResult:
     seed: int = 0
     wall_ns: int = 0
     message: str = ""
+    warmup: int = 0
+    environment: Dict[str, Any] = field(default_factory=dict)   # CPU identity, affinity, timer, worker version (13.4)
+    launch: Dict[str, Any] = field(default_factory=dict)        # cpus requested, taskset applied, isolation, uid
+    reference_sha256: str = ""
+    candidate_sha256: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -144,6 +174,19 @@ class Verifier:
         self._timing_free = list(range(n_t))
         self._timing_cv = threading.Condition()
         self.stats = {"runs": 0, "timing_runs": 0, "wall_ns": 0}
+        # Everything a cached result depends on besides the program and the inputs (12.5): interpreter, worker and
+        # codec versions, isolation mode and uid, sandbox limits, comparison policy and the measurement host.
+        self.identity: Dict[str, Any] = dict(self.runner.identity())
+        self.identity.update({"dict_order": "ignore", "float_rel_tol": self.v.float_rel_tol, "float_abs_tol": self.v.float_abs_tol,
+                              "check_timing_workload_outputs": self.v.check_timing_workload_outputs,
+                              "smoke_examples_per_function": self.v.smoke_examples_per_function})
+        try:
+            env = self.runner.selfcheck()
+            self.identity["cpu_model"] = env.get("cpu_model")
+            self.identity["cpu_count"] = env.get("cpu_count")
+        except Exception:  # noqa: BLE001 - a runner constructed with selfcheck=False (tests)
+            pass
+        self.identity_sha256 = hash_json(self.identity)
 
     # ------------------------------------------------------------------ #
     # infrastructure
@@ -229,14 +272,14 @@ class Verifier:
                           hash_seed: Optional[int] = None, deadline: Optional[float] = None) -> List[Dict[str, Any]]:
         """Behaviour of the immutable original on ``calls`` (cached; the original is deterministic by eligibility)."""
         hs = self.v.hash_seed if hash_seed is None else hash_seed
-        key = hash_json(["ref_v1", p0.hash, hash_json(codec.encode(tuple(tuple(c) for c in calls))), output, hs])
+        key = hash_json(["ref_v2", self.identity_sha256, p0.hash, hash_json(codec.encode(tuple(tuple(c) for c in calls))), output, hs])
         hit = self._cache_get(key)
         if hit is not None:
             return hit
         resp = self.run_calls(p0, calls, output=output, hash_seed=hs, deadline=deadline)
         if resp.get("status") != "ok" or len(resp.get("records", [])) != len(calls):
             raise InfrastructureError(f"reference program failed: {resp.get('status')}: {str(resp.get('message', ''))[:200]}")
-        recs = resp["records"]
+        recs = [validate_record(r, output) for r in resp["records"]]
         if any("unencodable" in r or r.get("exc") == "__timeout__" for r in recs):
             raise InfrastructureError("reference behaviour is not representable under the contract")
         self._cache_put(key, recs)
@@ -247,6 +290,7 @@ class Verifier:
                         float_rel: float = 0.0, float_abs: float = 0.0) -> Optional[Mismatch]:
         for i, (e, g) in enumerate(zip(ref, got)):
             call = calls[i] if i < len(calls) else None
+            g = validate_record(g, "digest" if ("digest" in e) else "full")
             if g.get("exc") == "__timeout__":
                 return Mismatch(i, "timeout", "call timed out", call)
             if "unencodable" in g:
@@ -325,7 +369,9 @@ class Verifier:
             return CheckResult(True, stage, n_checked=len(calls), wall_ns=wall, cpu_s=cpu)
         fb = self._feedback(m, probe_ids[m.index] if probe_ids and m.index < len(probe_ids) else None) if public else None
         msg = m.category if not public else f"{m.category}: {m.detail}"[:300]
-        return CheckResult(False, stage, mismatch_kind, m.category, msg, fb, m.index + 1, wall, cpu)
+        # a private failure reports the suite size, never the position of the first failing hidden input (T18)
+        n = m.index + 1 if public else len(calls)
+        return CheckResult(False, stage, mismatch_kind, m.category, msg, fb, n, wall, cpu)
 
     # ------------------------------------------------------------------ #
     # stages
@@ -345,7 +391,7 @@ class Verifier:
         return self._check("probe", task.original(), candidate, calls, mismatch_kind="probe_mismatch", public=True,
                            probe_ids=[p for p, _ in probes], deadline=deadline)
 
-    def mandatory_checks(self, task: PublicTask, private: PrivateSuite, candidate: Program, *,
+    def mandatory_checks(self, task: PublicTask, private: "OnlineSuite | PrivateSuite", candidate: Program, *,
                          deadline: Optional[float] = None) -> CheckResult:
         p0 = task.original()
         r = self._check("mandatory", p0, candidate, private.online_correctness, mismatch_kind="private_mismatch",
@@ -360,25 +406,30 @@ class Verifier:
                            cpu_s=r.cpu_s + r2.cpu_s)
 
     def outcome_matrix(self, task: PublicTask, candidate: Program, calls: Sequence[Call], *,
-                       deadline: Optional[float] = None) -> List[Optional[str]]:
+                       deadline: Optional[float] = None, with_cost: bool = False):
         """Per-call discrepancy category (None = same behaviour as the original); used to label probe data.
-        A candidate-level failure (does not load, crashes) marks every call with that failure kind."""
+        A candidate-level failure (does not load, crashes) marks every call with that failure kind.  With
+        ``with_cost`` also returns the measured elapsed nanoseconds of every candidate call (8.2 'elapsed cost')."""
         if not calls:
-            return []
+            return ([], []) if with_cost else []
         p0 = task.original()
         ref = self.reference_records(p0, calls, deadline=deadline)
         resp = self.run_calls(candidate, calls, deadline=deadline)
         if resp.get("status") != "ok":
-            return [str(resp.get("status"))] * len(calls)
+            out = [str(resp.get("status"))] * len(calls)
+            return (out, [None] * len(calls)) if with_cost else out
         got = resp.get("records", [])
         out: List[Optional[str]] = []
+        cost: List[Optional[int]] = []
         for i, c in enumerate(calls):
             if i >= len(got):
                 out.append("missing_record")
+                cost.append(None)
                 continue
             m = self.compare_records([ref[i]], [got[i]], [c], self.v.float_rel_tol, self.v.float_abs_tol)
             out.append(m.category if m else None)
-        return out
+            cost.append(got[i].get("elapsed_ns"))
+        return (out, cost) if with_cost else out
 
     def redacted(self, r: CheckResult) -> CheckResult:
         """Category-only copy of a private check result (what may leave the evaluator)."""
@@ -387,15 +438,19 @@ class Verifier:
     # ------------------------------------------------------------------ #
     # timing
     # ------------------------------------------------------------------ #
-    def calibrate(self, p0: Program, workload: Sequence[Call], *, hash_seed: Optional[int] = None,
+    def calibrate(self, reference: Program, workload: Sequence[Call], *, hash_seed: Optional[int] = None,
                   deadline: Optional[float] = None) -> int:
-        key = hash_json(["calib_v1", p0.hash, hash_json(codec.encode(tuple(tuple(c) for c in workload))),
+        """Repetition count that makes one block of ``reference`` on ``workload`` last about ``block_target_ms``
+        (13.4 step 2).  Calibrated on the *reference of the pair* - the current best during search, the original in
+        the audit - so blocks stay measurable after accepted speedups; keyed by host identity, never reused across
+        machines or interpreters."""
+        key = hash_json(["calib_v2", self.identity_sha256, reference.hash, hash_json(codec.encode(tuple(tuple(c) for c in workload))),
                          self.v.block_target_ms])
         hit = self._cache_get(key)
         if hit is not None:
             return int(hit)
         req = self.runner.base_request("calibrate")
-        req.update(code=p0.executable(), entry="_tp_entry", workload=list(workload), target_ms=self.v.block_target_ms)
+        req.update(code=reference.executable(), entry="_tp_entry", workload=list(workload), target_ms=self.v.block_target_ms)
         resp = self._run(req, deadline=deadline, hash_seed=hash_seed, timing=True)
         if resp.get("status") != "ok":
             raise InfrastructureError(f"calibration of the original failed: {resp.get('status')} {resp.get('message', '')}")
@@ -412,32 +467,40 @@ class Verifier:
                       blocks: int, seed: int, rule: Optional[str] = None, threshold: Optional[float] = None,
                       hash_seed: Optional[int] = None, deadline: Optional[float] = None) -> TimingResult:
         t0 = time.perf_counter_ns()
-        reps = self.calibrate(task.original(), workload, hash_seed=hash_seed, deadline=deadline)
+        reps = self.calibrate(reference, workload, hash_seed=hash_seed, deadline=deadline)
         ref_ns: List[int] = []
         cand_ns: List[int] = []
         orders: List[str] = []
+        environment: Dict[str, Any] = {}
+        launch: Dict[str, Any] = {}
         chunks = [1] * blocks if self.v.fresh_process_per_block else [blocks]
         for ci, nb in enumerate(chunks):
             req = self.runner.base_request("time_pair")
             req.update(code_a=reference.executable(), code_b=candidate.executable(), entry="_tp_entry",
                        workload=list(workload), blocks=nb, reps=reps, warmup=self.v.timing_warmup, seed=seed * 1009 + ci)
             resp = self._run(req, deadline=deadline, hash_seed=hash_seed, timing=True)
+            meta = resp.get("_meta", {})
+            launch = {k: meta.get(k) for k in ("cpus", "taskset_applied", "isolation", "uid", "hash_seed")}
+            environment = resp.get("environment", environment) or environment
             if resp.get("status") != "ok":
                 return TimingResult(False, resp.get("status", "error"), None, ref_ns, cand_ns, orders, reps, seed,
-                                    time.perf_counter_ns() - t0, str(resp.get("message", ""))[:300])
+                                    time.perf_counter_ns() - t0, str(resp.get("message", ""))[:300], self.v.timing_warmup,
+                                    environment, launch, reference.hash, candidate.hash)
             ref_ns += [int(x) for x in resp["a_ns"]]
             cand_ns += [int(x) for x in resp["b_ns"]]
             orders += list(resp["orders"])
         verdict = timing_verdict(ref_ns, cand_ns, threshold=threshold or self.v.accept_incremental_speedup,
                                  rule=rule or self.v.accept_rule, draws=self.v.timing_bootstrap_draws,
                                  level=self.v.timing_interval, seed=seed, legacy_delta=self.v.legacy_delta)
-        return TimingResult(True, "ok", verdict, ref_ns, cand_ns, orders, reps, seed, time.perf_counter_ns() - t0)
+        return TimingResult(True, "ok", verdict, ref_ns, cand_ns, orders, reps, seed, time.perf_counter_ns() - t0, "",
+                            self.v.timing_warmup, environment, launch, reference.hash, candidate.hash)
 
     # ------------------------------------------------------------------ #
     # profiling (public workload)
     # ------------------------------------------------------------------ #
     def profile(self, task: PublicTask, program: Program, *, deadline: Optional[float] = None) -> ProfileSnapshot:
-        key = hash_json(["profile_v1", program.hash, task.task_id, hash_json(codec.encode(tuple(tuple(c) for c in task.public_workload)))])
+        key = hash_json(["profile_v2", self.identity_sha256, program.hash, task.task_id,
+                         hash_json(codec.encode(tuple(tuple(c) for c in task.public_workload)))])
         hit = self._cache_get(key)
         if hit is not None:
             return ProfileSnapshot(hit["program_hash"], {k: FunctionProfile(**v) for k, v in hit["functions"].items()},

@@ -63,10 +63,14 @@ class ModelCfg:
 class RoleDecoding:
     max_input: int = 1408
     max_output: int = 640
-    mode: str = "greedy"              # "greedy" | "sample"
+    mode: str = ""                    # "greedy" | "sample"; "" = derived: sample iff a temperature != 1.0 is given
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not self.mode:
+            self.mode = "sample" if float(self.temperature) != 1.0 else "greedy"
 
 
 def _rd(i: int, o: int, mode: str = "greedy", temperature: float = 1.0) -> Any:
@@ -137,7 +141,8 @@ class SandboxCfg:
     process_timeout_s: float = 180.0
     max_output_bytes: int = 16_000_000
     isolation: str = "rlimits"        # "rlimits" | "unshare" | "bwrap"
-    drop_to_uid: Optional[int] = None  # e.g. 65534 when running as root
+    drop_to_uid: Optional[int] = None  # uid for workers when the harness runs as root (None = 65534 "nobody")
+    run_as_root: bool = False          # explicit opt-out of the privilege drop (never the default)
     python: str = ""                  # interpreter for workers ("" = sys.executable)
     allowed_modules: List[str] = field(default_factory=lambda: list(EnvConfig().allowed_modules))
     timing_cpus: List[int] = field(default_factory=list)       # reserved cores for timing workers (taskset)
@@ -168,6 +173,7 @@ class TrainingCfg:
     eval_every: int = 100
     seed: int = 0
     max_updates: int = 0               # 0 = no cap beyond epochs (smoke tests set a cap)
+    exec_eval: bool = True             # M3/M5 selection by executable development outcomes (accepted speedups)
 
 
 @dataclass
@@ -186,6 +192,7 @@ class RLCfg:
     slot_cost: float = 0.015
     invalid_penalty: float = 0.10
     ratio_tolerance: float = 0.05     # max |log(new/old)| allowed before the first update (numerical tolerance)
+    likelihood: str = "effective"     # log-probs are always computed under the filtered, renormalised distribution
     minibatch: int = 8
     save_every: int = 25
     seed: int = 0
@@ -204,6 +211,7 @@ class ServingCfg:
     max_pending_candidates: int = 16
     batch_window_ms: float = 2.0
     max_batch: int = 32
+    scheduler_mode: str = "latency"    # "latency" | "throughput" (14.3 configurable throughput mode)
     episode_workers: int = 4
     device: str = "auto"
     length_buckets: List[int] = field(default_factory=lambda: [256, 512, 1024, 2048])
@@ -242,6 +250,11 @@ class DataCfg:
     manual_review_n: int = 40
     workers: int = 4
     menu_size: int = 12
+    history_variants: int = 2          # M1: attempt-history variants per labelled state (5.1)
+    replay_recent_frac: float = 0.7    # projection: share of the most recent collection round (10.4: 70 % / 30 %)
+    mechanism_balance: bool = True     # projection: balance mechanisms by verified opportunities, not raw counts
+    curriculum_stages: List[int] = field(default_factory=lambda: [1, 2, 3])   # 1 clean, 2 alternatives/no-benefit, 3 multi-function/intermediate
+    label_bundle: str = "latest"       # M1 target labels: "latest" (newest downstream bundle), "all" or a bundle hash
 
 
 @dataclass
@@ -299,6 +312,8 @@ class ChainConfig:
                 errs.append(f"roles.{r}.mode must be greedy|sample")
             if d.mode == "sample" and d.temperature <= 0:
                 errs.append(f"roles.{r}.temperature must be > 0 when sampling")
+            if d.mode == "greedy" and (float(d.temperature) != 1.0 or d.top_k or d.top_p < 1.0):
+                errs.append(f"roles.{r}: mode=greedy is incompatible with temperature/top_k/top_p (they would be silently ignored)")
             if d.top_k < 0 or not (0 < d.top_p <= 1.0):
                 errs.append(f"roles.{r}: bad top_k/top_p")
         b = self.budget
@@ -343,8 +358,20 @@ class ChainConfig:
         if self.serving.compile_enabled:
             errs.append("serving.compile_enabled: the serving engine runs eager; benchmark compiled paths with "
                         "python -m tinyperf_chain.serve.bench --compile before enabling anything")
+        if self.serving.scheduler_mode not in ("latency", "throughput"):
+            errs.append("serving.scheduler_mode must be latency|throughput")
+        if any(r not in ROLE_NAMES for r in self.serving.resident_roles):
+            errs.append("serving.resident_roles: unknown role")
         if self.serving.timing_workers < 1 or self.serving.correctness_workers < 1:
             errs.append("serving: need at least one timing and one correctness worker")
+        if self.serving.timing_workers > 1 and len(set(self.sandbox.timing_cpus)) < self.serving.timing_workers:
+            errs.append("serving.timing_workers > 1 requires one reserved core per worker in sandbox.timing_cpus "
+                        "(non-overlapping physical cores, 13.5)")
+        if set(self.sandbox.timing_cpus) & set(self.sandbox.correctness_cpus):
+            errs.append("sandbox.timing_cpus and sandbox.correctness_cpus must not overlap")
+        if self.rl.likelihood not in ("effective",):
+            errs.append("rl.likelihood must be 'effective': with temperature/top-k/top-p filtering the stored behaviour "
+                        "log-probabilities and the recomputed ones must come from the same renormalised distribution")
         if self.rl.top_k < 0 or not (0 < self.rl.top_p <= 1.0) or self.rl.temperature <= 0:
             errs.append("rl: bad sampling settings")
         if not (0 < self.rl.clip_low < 1.0 < self.rl.clip_high):
@@ -360,6 +387,10 @@ class ChainConfig:
             errs.append("training.tie_mode must be sample|sum")
         if self.training.shared_sampling not in ("uniform_role", "token_matched"):
             errs.append("training.shared_sampling must be uniform_role|token_matched")
+        if not (0.0 < self.data.replay_recent_frac <= 1.0):
+            errs.append("data.replay_recent_frac must be in (0, 1]")
+        if any(c not in (1, 2, 3) for c in self.data.curriculum_stages) or not self.data.curriculum_stages:
+            errs.append("data.curriculum_stages must be a non-empty subset of [1, 2, 3]")
         # ---- purpose-specific ----
         if purpose.startswith("collect"):
             split = purpose.split(":", 1)[1] if ":" in purpose else ""
@@ -416,6 +447,48 @@ def _load_raw(path: str, depth: int = 0) -> Dict[str, Any]:
     return raw
 
 
+def _check_scalar(t: Any, v: Any, where: str) -> Any:
+    """Validate a value against a (possibly Optional / List / Dict) type hint; bools never pass as ints."""
+    origin = typing.get_origin(t)
+    args = typing.get_args(t)
+    if origin is typing.Union:
+        if v is None and type(None) in args:
+            return v
+        inner = [a for a in args if a is not type(None)]
+        last: Optional[ConfigError] = None
+        for a in inner:
+            try:
+                return _check_scalar(a, v, where)
+            except ConfigError as e:
+                last = e
+        raise last or ConfigError(f"{where}: bad value")
+    if origin in (list, List):
+        if not isinstance(v, list):
+            raise ConfigError(f"{where}: expected a list, got {type(v).__name__}")
+        return [_check_scalar(args[0], x, f"{where}[{i}]") for i, x in enumerate(v)] if args else v
+    if origin in (dict, Dict):
+        if not isinstance(v, dict):
+            raise ConfigError(f"{where}: expected a mapping, got {type(v).__name__}")
+        return {k: (_check_scalar(args[1], x, f"{where}.{k}") if args else x) for k, x in v.items()}
+    if t is bool:
+        if not isinstance(v, bool):
+            raise ConfigError(f"{where}: expected true/false, got {v!r}")
+        return v
+    if t is int:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ConfigError(f"{where}: expected an integer, got {v!r}")
+        return v
+    if t is float:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ConfigError(f"{where}: expected a number, got {v!r}")
+        return float(v)
+    if t is str:
+        if not isinstance(v, str):
+            raise ConfigError(f"{where}: expected a string, got {v!r}")
+        return v
+    return v
+
+
 def _typed(cls, d: Any, where: str):
     if not isinstance(d, dict):
         raise ConfigError(f"{where}: expected a mapping, got {type(d).__name__}")
@@ -433,7 +506,7 @@ def _typed(cls, d: Any, where: str):
         if is_dataclass(t):
             kwargs[f.name] = _typed(t, v, f"{where}.{f.name}")
         else:
-            kwargs[f.name] = v
+            kwargs[f.name] = _check_scalar(t, v, f"{where}.{f.name}")
     try:
         return cls(**kwargs)
     except TypeError as e:  # pragma: no cover - defensive

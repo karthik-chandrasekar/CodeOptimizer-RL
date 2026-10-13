@@ -40,22 +40,30 @@ SUITES = {"development": ("dev", "dev"), "dev": ("dev", "dev"), "confirmation": 
 
 
 class _System:
-    def __init__(self, system_id: str, runner):
+    def __init__(self, system_id: str, runner, group: Optional[str] = None, training_seed: Optional[int] = None):
         self.system_id = system_id
         self.runner = runner      # callable(task, private, spec) -> record
+        self.group = group or system_id          # replicate group (15.5: bundles trained with different seeds)
+        self.training_seed = training_seed
 
 
-def make_systems(cfg: ChainConfig, verifier: Verifier, bundles: Sequence[str], legacy: Optional[str], legacy_id: str,
-                 device: str, use_scheduler: bool, locked: bool, allow_env_mismatch: bool) -> Tuple[List[_System], Dict[str, Any]]:
-    systems, meta = [], {}
+def make_systems(cfg: ChainConfig, verifier: Verifier, bundles: Sequence[str], legacy: Sequence[str], legacy_ids: Sequence[str],
+                 device: str, use_scheduler: bool, locked: bool, allow_env_mismatch: bool) -> Tuple[List[_System], Dict[str, Any], Dict[str, Any]]:
+    """Returns (systems, metadata, resources).  ``resources`` holds the engines and schedulers so the session can
+    report their measured stats (prefill/decode/queue-wait/peak cache memory)."""
+    systems, meta, resources = [], {}, {"engines": {}, "schedulers": {}}
     for path in bundles:
         b = load_bundle_json(path)
         if locked:
             verify_lock(b, cfg, allow_env_mismatch)
         router, res = build_router(b, cfg, device=device, use_scheduler=use_scheduler)
         ctrl = ChainController(cfg, verifier, router)
-        systems.append(_System(router.system_id, ctrl.run_episode))
-        meta[router.system_id] = {"bundle": path, "bundle_sha256": router.bundle_hash, "roles": router.describe()}
+        systems.append(_System(router.system_id, ctrl.run_episode, b.get("replicate_of"), b.get("training_seed")))
+        meta[router.system_id] = {"bundle": path, "bundle_sha256": router.bundle_hash, "roles": router.describe(),
+                                  "replicate_of": b.get("replicate_of"), "training_seed": b.get("training_seed")}
+        resources["engines"][router.system_id] = res["engines"]
+        if res.get("scheduler") is not None:
+            resources["schedulers"][router.system_id] = res["scheduler"]
     if legacy:
         from tinyperf.model.tokenizer import CodeTokenizer
         from tinyperf.model.transformer import TinyPerfLM
@@ -64,14 +72,51 @@ def make_systems(cfg: ChainConfig, verifier: Verifier, bundles: Sequence[str], l
         from tinyperf_chain.serve.engine import RoleEngine
 
         tok = CodeTokenizer(cfg.model.tokenizer)
-        eng = RoleEngine(TinyPerfLM.load(legacy), device=device, checkpoint_sha256=sha256_file(legacy))
-        lsys = LegacyDirectEditSystem(cfg, verifier, eng, tok, system_id=legacy_id, bundle_hash=sha256_file(legacy))
-        systems.append(_System(legacy_id, lsys.run_episode))
-        meta[legacy_id] = {"legacy_checkpoint": legacy, "sha256": eng.checkpoint_sha256}
+        ids = list(legacy_ids) + [f"B0_{i}" for i in range(len(legacy_ids), len(legacy))]
+        for ck, sid in zip(legacy, ids):
+            eng = RoleEngine(TinyPerfLM.load(ck), device=device, checkpoint_sha256=sha256_file(ck))
+            lsys = LegacyDirectEditSystem(cfg, verifier, eng, tok, system_id=sid, bundle_hash=sha256_file(ck))
+            systems.append(_System(sid, lsys.run_episode))
+            meta[sid] = {"legacy_checkpoint": ck, "sha256": eng.checkpoint_sha256, **lsys.describe()}
+            resources["engines"][sid] = {ck: eng}
     ids = [s.system_id for s in systems]
     if len(set(ids)) != len(ids):
         raise SystemExit(f"duplicate system ids {ids}")
-    return systems, meta
+    return systems, meta, resources
+
+
+def _peak_memory() -> Dict[str, Any]:
+    import resource
+
+    out: Dict[str, Any] = {}
+    try:
+        out["host_peak_rss_mb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        out["children_peak_rss_mb"] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024.0
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            out["device_peak_allocated_mb"] = torch.cuda.max_memory_allocated() / 1e6
+            out["device_peak_reserved_mb"] = torch.cuda.max_memory_reserved() / 1e6
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _resource_stats(resources: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"engines": {}, "schedulers": {}}
+    seen = set()
+    for sid, engs in resources.get("engines", {}).items():
+        for ck, eng in engs.items():
+            if id(eng) in seen:
+                continue
+            seen.add(id(eng))
+            out["engines"][f"{sid}:{os.path.basename(ck)}"] = dict(eng.stats)
+    for sid, sch in resources.get("schedulers", {}).items():
+        out["schedulers"][sid] = {k: dict(v) for k, v in sch.stats.items()}
+    return out
 
 
 def run_session(cfg: ChainConfig, tasks: Sequence[Tuple[PublicTask, PrivateSuite]], systems: Sequence[_System], out_dir: str,
@@ -79,7 +124,19 @@ def run_session(cfg: ChainConfig, tasks: Sequence[Tuple[PublicTask, PrivateSuite
                 workers: int = 1, events: bool = True) -> Dict[str, Any]:
     os.makedirs(out_dir, exist_ok=True)
     ledger = AppendLedger(os.path.join(out_dir, "episodes.jsonl"))
-    finished = {r.get("episode_id") for r in ledger.read()}    # resume: an interrupted session skips completed episodes
+    prior = list(ledger.read())
+    # resume (12.5, T25): completed episodes are skipped only when they were produced by the *same* bundle; a record
+    # from a different bundle hash means the session is a different experiment and must start separately
+    by_sys = {s.system_id: s for s in systems}
+    for r in prior:
+        sid = r.get("system_id")
+        if sid in by_sys and hasattr(by_sys[sid].runner, "__self__"):
+            want = getattr(getattr(by_sys[sid].runner.__self__, "router", None), "bundle_hash", None) or \
+                getattr(by_sys[sid].runner.__self__, "bundle_hash", None)
+            if want is not None and r.get("bundle_sha256") != want:
+                raise SystemExit(f"{out_dir}: existing records for {sid} were produced by bundle {r.get('bundle_sha256')!r}, "
+                                 f"not {want!r}; start a separately identified session (different --output)")
+    finished = {r.get("episode_id") for r in prior}
     units = [(t, p, e, slots) for (t, p) in tasks for e in range(episodes_per_file) for slots in patch_slots]
     lock = threading.Lock()
     done = {"n": 0}
@@ -98,6 +155,8 @@ def run_session(cfg: ChainConfig, tasks: Sequence[Tuple[PublicTask, PrivateSuite
             rec = s.runner(task, private, EpisodeSpec(eid, seed=seed, mode=mode, patch_slots=slots, events_path=ev))
             rec.pop("events", None)
             rec["episode_index"] = e
+            rec["system_group"] = s.group
+            rec["training_seed"] = s.training_seed
             ledger.append(rec)
             with lock:
                 done["n"] += 1
@@ -114,9 +173,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     p.add_argument("--suite", required=True)
     p.add_argument("--kinds", nargs="+", default=["files"])
     p.add_argument("--bundle", nargs="*", default=[])
-    p.add_argument("--legacy-checkpoint", default=None)
-    p.add_argument("--legacy-system-id", default="B0")
-    p.add_argument("--output", required=True)
+    p.add_argument("--legacy-checkpoint", nargs="*", default=[], help="B0 / direct-edit arms (one system per checkpoint)")
+    p.add_argument("--legacy-system-id", nargs="*", default=["B0"])
+    p.add_argument("--output", default=None, help="default: <paths.runs>/<suite>")
     p.add_argument("--episodes-per-file", type=int, default=4)
     p.add_argument("--patch-slots", nargs="*", default=[])
     p.add_argument("--limit", type=int, default=0)
@@ -127,9 +186,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     p.add_argument("overrides", nargs="*")
     a = p.parse_args(argv)
     from tinyperf_chain.config import pop_overrides
-    pop_overrides(a, ['bundle', 'kinds', 'patch_slots'])
+    pop_overrides(a, ['bundle', 'kinds', 'patch_slots', 'legacy_checkpoint', 'legacy_system_id'])
     a.patch_slots = [int(x) for x in a.patch_slots]
     cfg = load_chain_config(a.config, a.overrides)
+    if not a.bundle and not a.legacy_checkpoint:
+        raise SystemExit("nothing to evaluate: pass --bundle bundle.json [...] and/or --legacy-checkpoint ckpt.pt")
     split, mode = SUITES.get(a.suite, (a.suite, "dev"))
     confirm = split == "confirm"
     if a.calibrate_wall:
@@ -143,6 +204,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     tasks: List[Tuple[PublicTask, PrivateSuite]] = []
     for kind in a.kinds:
         suite = f"{split}_{kind}" if a.suite in SUITES else a.suite
+        if not os.path.exists(store.public_path(suite)):
+            raise SystemExit(f"task suite {suite!r} not found under {cfg.paths.tasks} (build it with "
+                             f"tinyperf_chain.data.split / build_tasks, or point paths.root at the artifact root)")
         pubs = store.load_public(suite, a.limit)
         priv = store.load_private(suite)
         tasks += [(t, priv[t.task_id]) for t in pubs]
@@ -153,10 +217,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     device = resolve_device(cfg.serving.device)
     verifier = Verifier(cfg, cache_dir=cfg.paths.cache)
     workers = max(1, cfg.serving.episode_workers)
-    systems, meta = make_systems(cfg, verifier, a.bundle, a.legacy_checkpoint, a.legacy_system_id, device,
-                                 use_scheduler=workers > 1, locked=confirm, allow_env_mismatch=a.allow_env_mismatch)
+    systems, meta, resources = make_systems(cfg, verifier, a.bundle, a.legacy_checkpoint, a.legacy_system_id, device,
+                                            use_scheduler=workers > 1, locked=confirm, allow_env_mismatch=a.allow_env_mismatch)
     slots = a.patch_slots or [None]
-    out = a.output
+    out = a.output or cfg.paths.sub("runs", a.suite)
     os.makedirs(out, exist_ok=True)
     session = {"suite": a.suite, "split": split, "n_tasks": len(tasks), "systems": meta, "config_sha256": config_hash(cfg),
                "environment": environment_manifest(), "episodes_per_file": a.episodes_per_file,
@@ -169,6 +233,13 @@ def main(argv: Optional[List[str]] = None) -> None:
     session.update(res)
     session["finished"] = time.time()
     session["verifier_stats"] = verifier.stats
+    session["sandbox_stats"] = dict(verifier.runner.stats)
+    session["verifier_identity"] = verifier.identity
+    session["peak_memory"] = _peak_memory()
+    session["serving_stats"] = _resource_stats(resources)
+    session["n_systems"] = len(systems)
+    for sch in resources.get("schedulers", {}).values():
+        sch.close()
     with open(os.path.join(out, "session.json"), "w") as f:
         json.dump(session, f, indent=1)
     if a.calibrate_wall:

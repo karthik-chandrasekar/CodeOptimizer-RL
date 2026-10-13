@@ -83,10 +83,25 @@ PY
 rm -rf "$A/runs/dev"
 python -m tinyperf_chain.eval.run $CFG --suite development --bundle "$A/R.json" "$A/B3.json" "$A/B4.json" "$A/M0.json" \
     --legacy-checkpoint "$A/seed.pt" --output "$A/runs/dev" --episodes-per-file 1 --limit 2 --patch-slots 2 6 $OVR
-python -m tinyperf_chain.eval.aggregate --runs "$A/runs/dev/episodes.jsonl" --paired --reference R
-python -m tinyperf_chain.eval.roles $CFG --bundle "$A/R.json" --split dev --limit 4 $OVR > "$A/roles_R.json"
+python -m tinyperf_chain.eval.aggregate --runs "$A/runs/dev/episodes.jsonl" --paired --reference R --ablation-pairs B4:B3 B4:R
+python -m tinyperf_chain.eval.roles $CFG --bundle "$A/R.json" --split dev --limit 4 --holdout-families cmp_swap $OVR > "$A/roles_R.json"
 python -m tinyperf_chain.eval.roles $CFG --bundle "$A/B4.json" --split dev --limit 3 $OVR > "$A/roles_B4.json"
-python -c "import json;d=json.load(open('$A/roles_R.json'));print('role diagnostics (rules):', {k: d[k] for k in ('m1', 'm5')})"
+python -c "import json;d=json.load(open('$A/roles_R.json'));print('role diagnostics (rules):', {k: d[k] for k in ('m1', 'm2', 'm5')})"
+python -m tinyperf_chain.eval.promote --report "$A/runs/dev/report.json" --candidate B4 --incumbent R \
+    --role-report "$A/roles_B4.json" --role-baseline "$A/roles_R.json" --out "$A/promotion_B4.json" || echo "promotion gate: B4 not promoted over R (expected for untrained toy models)"
+
+echo "== 8b. on-policy refresh: states from the rule bundle, M2/M1 relabelled on them, replay-mixed projection  $(date +%T)"
+python -m tinyperf_chain.data.collect $CFG --split train --stages onpolicy --bundle "$A/R.json" --limit 3 $OVR
+python -m tinyperf_chain.data.collect $CFG --split train --stages plans targets probes repairs gate --onpolicy-states --limit 6 $OVR
+python -m tinyperf_chain.data.project $CFG --splits train dev --manifest "$A/split_manifest.json" $OVR > "$A/projection_round1.log"
+python - "$A" <<'PY'
+import json, sys
+rep = json.load(open(f"{sys.argv[1]}/datasets/projection_report.json"))
+for k in ("M1/train", "M2/train", "M3/train"):
+    print(k, {kk: rep[k].get(kk) for kk in ("records", "stages", "replay", "mechanism_counts")})
+PY
+python -m tinyperf_chain.serve.bench checks $CFG --suite dev_files --n 4 --engine-checkpoint "$A/checkpoints/M3_sft/final.pt" $OVR > "$A/bench_checks.json"
+python -c "import json;d=json.load(open('$A/bench_checks.json'));print('eq.10 forecast (mean):', d['forecast']['mean_s'])"
 
 echo "== 9. lock a bundle and verify it  $(date +%T)"
 python - "$A" <<'PY'

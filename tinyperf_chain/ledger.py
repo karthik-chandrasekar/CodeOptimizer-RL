@@ -92,7 +92,13 @@ class AppendLedger:
 
 
 class EventLog:
-    """Per-episode event stream (in memory, optionally mirrored to a JSONL file)."""
+    """Per-episode event stream: kept in memory and, when a path is given, appended to a ``.partial`` JSONL file as
+    each event happens (an interrupted episode leaves its events on disk), then renamed atomically on ``flush``.
+
+    Every event carries ``t_mono_ns`` (emission), ``proc_cpu_s`` and, when the caller measured an interval,
+    ``start_mono_ns`` / ``end_mono_ns`` via :meth:`span`.  Episode-wide constants (bundle hash, system id) are
+    stamped on every event by :meth:`stamp`.
+    """
 
     def __init__(self, episode_id: str, path: Optional[str] = None):
         self.episode_id = episode_id
@@ -100,23 +106,47 @@ class EventLog:
         self.events: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
         self._seq = 0
+        self._constants: Dict[str, Any] = {}
+        self._fh = None
         if path:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(path + ".partial", "w")
+
+    def stamp(self, **constants: Any) -> None:
+        """Fields copied onto every subsequent event (bundle hash, system id, task id)."""
+        self._constants.update(constants)
 
     def emit(self, kind: str, **fields: Any) -> Dict[str, Any]:
         with self._lock:
             ev = {"episode_id": self.episode_id, "seq": self._seq, "kind": kind,
-                  "t_mono_ns": time.monotonic_ns(), "proc_cpu_s": time.process_time(), **fields}
+                  "t_mono_ns": time.monotonic_ns(), "proc_cpu_s": time.process_time(), **self._constants, **fields}
             self._seq += 1
             self.events.append(ev)
+            if self._fh is not None:
+                self._fh.write(json.dumps(ev, separators=(",", ":"), default=str) + "\n")
+                self._fh.flush()
         return ev
+
+    @staticmethod
+    def span(start_ns: int, end_ns: Optional[int] = None) -> Dict[str, int]:
+        """``start_mono_ns`` / ``end_mono_ns`` / ``elapsed_ns`` fields for an interval measured by the caller."""
+        end_ns = time.monotonic_ns() if end_ns is None else end_ns
+        return {"start_mono_ns": start_ns, "end_mono_ns": end_ns, "elapsed_ns": end_ns - start_ns}
 
     def flush(self) -> None:
         if not self.path:
             return
         with self._lock:
-            tmp = self.path + ".tmp"
-            with open(tmp, "w") as f:
-                for ev in self.events:
-                    f.write(json.dumps(ev, separators=(",", ":"), default=str) + "\n")
-            os.replace(tmp, self.path)
+            if self._fh is not None:
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
+                self._fh.close()
+                self._fh = None
+            os.replace(self.path + ".partial", self.path)
+
+    def close(self) -> None:
+        """Abandon without the final rename (the ``.partial`` file stays as evidence of an interrupted episode)."""
+        with self._lock:
+            if self._fh is not None:
+                self._fh.close()
+                self._fh = None
